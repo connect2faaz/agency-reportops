@@ -25,6 +25,15 @@ def parse_date(value: Any) -> date | None:
     return date.fromisoformat(text)
 
 
+def parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
 def parse_float(value: Any) -> float:
     text = str(value or "").replace("$", "").replace(",", "").strip()
     return float(text or 0)
@@ -136,6 +145,7 @@ class Run:
     updated_at: datetime = field(default_factory=utc_now)
     approved_at: datetime | None = None
     delivered_at: datetime | None = None
+    last_am_review_sent_at: datetime | None = None
 
 
 @dataclass(slots=True)

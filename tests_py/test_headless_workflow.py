@@ -52,6 +52,18 @@ class FailingReportAI:
         raise AssertionError("Question drafting is not expected in this test")
 
 
+class CountingReportAI:
+    def __init__(self) -> None:
+        self.report_call_count = 0
+
+    def generate_report(self, client, metrics, review_notes):
+        self.report_call_count += 1
+        return OpenRouterClient.fake_report().generate_report(client, metrics, review_notes)
+
+    def draft_question_answer(self, client, question, report_html):
+        return OpenRouterClient.fake_report().draft_question_answer(client, question, report_html)
+
+
 class HeadlessWorkflowTests(unittest.TestCase):
     def test_select_due_clients_uses_utc_dates_and_manual_controls(self):
         clients = [
@@ -141,6 +153,152 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertEqual(store.messages[0].message_type, "account_manager_review")
         self.assertIn("Reference: run:", store.gmail.sent_messages[0]["body"])
         self.assertIn("display:none", store.gmail.sent_messages[0]["body"])
+
+    def test_scheduled_due_run_does_not_regenerate_existing_same_period_am_review(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.AM_REVIEW,
+                    html_report="<h1>Old</h1>",
+                    gmail_thread_id="thread_1",
+                    last_am_review_sent_at=datetime(2026, 6, 9, 18, tzinfo=timezone.utc),
+                )
+            ],
+        )
+        workflow = ReportingWorkflow(store=store, ai=FailingReportAI(), gmail=store.gmail)
+
+        with patch("reportops.workflow.utc_now", return_value=datetime(2026, 6, 10, tzinfo=timezone.utc)):
+            workflow.run_due_reports(today=date(2026, 6, 10), period="Feb-2026")
+
+        self.assertEqual(store.runs[0].html_report, "<h1>Old</h1>")
+        self.assertEqual(store.gmail.sent_messages, [])
+
+    def test_scheduled_due_run_sends_am_follow_up_after_one_day(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.AM_REVIEW,
+                    html_report="<h1>Old</h1>",
+                    gmail_thread_id="thread_1",
+                    last_am_review_sent_at=datetime(2026, 6, 8, 23, tzinfo=timezone.utc),
+                )
+            ],
+        )
+        workflow = ReportingWorkflow(store=store, ai=FailingReportAI(), gmail=store.gmail)
+
+        with patch("reportops.workflow.utc_now", return_value=datetime(2026, 6, 10, tzinfo=timezone.utc)):
+            workflow.run_due_reports(today=date(2026, 6, 10), period="Feb-2026")
+
+        self.assertEqual(len(store.gmail.sent_messages), 1)
+        self.assertEqual(store.gmail.sent_messages[0]["to"], "am@example.com")
+        self.assertEqual(store.gmail.sent_messages[0]["thread_id"], "thread_1")
+        self.assertIn("Following up on this report review", store.gmail.sent_messages[0]["body"])
+        self.assertIn("Reference: run:run_1", store.gmail.sent_messages[0]["body"])
+        self.assertEqual(store.messages[0].message_type, "account_manager_follow_up")
+        self.assertEqual(store.runs[0].last_am_review_sent_at, datetime(2026, 6, 10, tzinfo=timezone.utc))
+
+    def test_open_am_review_for_prior_period_does_not_block_new_period(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            metrics=[
+                MetricRow("client_1", "BrightSmile Dental", "Feb-2026", 100, 1000, 100, 10, 5, 20, 2, 2, 500, 5),
+                MetricRow("client_1", "BrightSmile Dental", "Mar-2026", 150, 1200, 120, 10, 8, 18.75, 3, 2.5, 700, 4.67),
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.AM_REVIEW,
+                    html_report="<h1>Old</h1>",
+                    gmail_thread_id="thread_1",
+                    last_am_review_sent_at=datetime(2026, 6, 9, tzinfo=timezone.utc),
+                )
+            ],
+        )
+        ai = CountingReportAI()
+        workflow = ReportingWorkflow(store=store, ai=ai, gmail=store.gmail)
+
+        workflow.run_due_reports(today=date(2026, 6, 10), period="Mar-2026")
+
+        self.assertEqual(ai.report_call_count, 1)
+        self.assertEqual([run.period for run in store.runs], ["Feb-2026", "Mar-2026"])
+
+    def test_manual_client_run_regenerates_existing_same_period_am_review(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            metrics=[
+                MetricRow("client_1", "BrightSmile Dental", "Feb-2026", 100, 1000, 100, 10, 5, 20, 2, 2, 500, 5),
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.AM_REVIEW,
+                    html_report="<h1>Old</h1>",
+                    gmail_thread_id="thread_1",
+                    last_am_review_sent_at=datetime(2026, 6, 9, tzinfo=timezone.utc),
+                )
+            ],
+        )
+        ai = CountingReportAI()
+        workflow = ReportingWorkflow(store=store, ai=ai, gmail=store.gmail)
+
+        workflow.run_client_report("client_1", today=date(2026, 6, 10), period="Feb-2026")
+
+        self.assertEqual(ai.report_call_count, 1)
+        self.assertEqual(len(store.gmail.sent_messages), 1)
+        self.assertEqual(store.messages[0].message_type, "account_manager_review")
+        self.assertNotEqual(store.runs[0].html_report, "<h1>Old</h1>")
 
     def test_sync_replies_only_lists_active_run_threads(self):
         class ThreadCapturingGmail:

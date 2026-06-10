@@ -18,6 +18,7 @@ from .models import Client, MessageRecord, MetricRow, Question, Run, RunStatus, 
 
 
 HIDDEN_REFERENCE_STYLE = "display:none;color:#ffffff;font-size:1px;line-height:1px;opacity:0;max-height:0;overflow:hidden;"
+AM_FOLLOW_UP_INTERVAL = timedelta(hours=24)
 
 
 def new_id(prefix: str) -> str:
@@ -107,6 +108,12 @@ class InMemorySheetStore:
                 return run
         return None
 
+    def run_for_report_period(self, client_id: str, period: str) -> Run | None:
+        for run in self.runs:
+            if run.client_id == client_id and run.period == period:
+                return run
+        return None
+
     def save_message(self, message: MessageRecord) -> None:
         self.messages.append(message)
 
@@ -125,11 +132,11 @@ class ReportingWorkflow:
 
     def run_due_reports(self, today: date, period: str | None = None) -> None:
         for client in select_due_clients(self.store.clients, today):
-            self._start_or_retry_report(client, period or self._default_period(today))
+            self._start_or_retry_report(client, period or self._default_period(today), force=False)
 
     def run_client_report(self, client_id: str, today: date, period: str | None = None) -> None:
         client = self.store.client_by_id(client_id)
-        self._start_or_retry_report(client, period or self._default_period(today))
+        self._start_or_retry_report(client, period or self._default_period(today), force=True)
 
     def sync_replies(self) -> None:
         for inbound in self.gmail.list_recent_replies(thread_ids=self._active_thread_ids()):
@@ -150,8 +157,12 @@ class ReportingWorkflow:
             elif run.status == RunStatus.REPLY_REVIEW:
                 self._handle_am_question_reply(run, inbound, reply_text)
 
-    def _start_or_retry_report(self, client: Client, period: str) -> None:
-        run = self.store.active_run_for(client.client_id, period)
+    def _start_or_retry_report(self, client: Client, period: str, force: bool = False) -> None:
+        run = self.store.run_for_report_period(client.client_id, period)
+        if run is not None and not force:
+            if run.status == RunStatus.AM_REVIEW:
+                self._send_am_follow_up_if_due(client, run)
+            return
         if run is None:
             run = Run(run_id=new_id("run"), client_id=client.client_id, period=period, status=RunStatus.AM_REVIEW)
             self.store.runs.append(run)
@@ -189,6 +200,9 @@ class ReportingWorkflow:
                 "X-ReportOps-Message-Type": "account_manager_review",
             },
         )
+        sent_at = utc_now()
+        run.last_am_review_sent_at = sent_at
+        run.updated_at = sent_at
         run.gmail_thread_id = sent["thread_id"]
         self.store.save_message(
             MessageRecord(
@@ -197,6 +211,43 @@ class ReportingWorkflow:
                 message_type="account_manager_review",
                 to=client.account_manager_email,
                 subject=f"{client.client_name} report ready for review",
+                gmail_message_id=sent["id"],
+                gmail_thread_id=sent["thread_id"],
+                status="sent",
+            )
+        )
+
+    def _send_am_follow_up_if_due(self, client: Client, run: Run) -> None:
+        now = utc_now()
+        if run.last_am_review_sent_at is not None and now - run.last_am_review_sent_at < AM_FOLLOW_UP_INTERVAL:
+            return
+        self._send_am_follow_up(client, run, now)
+
+    def _send_am_follow_up(self, client: Client, run: Run, sent_at: datetime) -> None:
+        body = (
+            "<p>Following up on this report review. Please reply Approved to send, "
+            "or reply with requested changes.</p>"
+            f"{self._hidden_reference(f'run:{run.run_id}')}"
+        )
+        sent = self.gmail.send_html(
+            to=client.account_manager_email,
+            subject=f"Re: {client.client_name} report ready for review",
+            html_body=body,
+            headers={
+                "X-ReportOps-Run-Id": run.run_id,
+                "X-ReportOps-Message-Type": "account_manager_follow_up",
+            },
+            thread_id=run.gmail_thread_id,
+        )
+        run.last_am_review_sent_at = sent_at
+        run.updated_at = sent_at
+        self.store.save_message(
+            MessageRecord(
+                message_id=new_id("message"),
+                run_id=run.run_id,
+                message_type="account_manager_follow_up",
+                to=client.account_manager_email,
+                subject=f"Re: {client.client_name} report ready for review",
                 gmail_message_id=sent["id"],
                 gmail_thread_id=sent["thread_id"],
                 status="sent",
@@ -217,7 +268,7 @@ class ReportingWorkflow:
         if intent == "request_changes":
             run.am_review_notes.append(reply_text)
             self.store.record_processed(inbound.message_id)
-            self._start_or_retry_report(client, run.period)
+            self._start_or_retry_report(client, run.period, force=True)
             return
         run.last_error = f"Unclear AM reply: {reply_text}"
         self.store.record_processed(inbound.message_id)

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timezone
 import unittest
 
 from reportops.ai import OpenRouterClient, StructuredOutputError
@@ -100,6 +100,26 @@ class GoogleSheetsStoreTests(unittest.TestCase):
         self.assertEqual(fake.tabs["Runs"][0]["run_id"], "run_1")
         self.assertEqual(fake.tabs["Runs"][0]["status"], "am_review")
         self.assertEqual(fake.tabs["Messages"][0]["gmail_message_id"], "gmail_1")
+
+    def test_persists_run_last_am_review_sent_at(self):
+        fake = FakeSheetClient()
+        fake.tabs["Runs"] = [
+            {
+                "run_id": "run_1",
+                "client_id": "client_1",
+                "period": "Feb-2026",
+                "status": "am_review",
+                "attempt_count": "1",
+                "last_am_review_sent_at": "2026-06-09T00:00:00+00:00",
+            }
+        ]
+        store = GoogleSheetsStore(fake)
+
+        self.assertEqual(store.runs[0].last_am_review_sent_at, datetime(2026, 6, 9, tzinfo=timezone.utc))
+
+        store.flush()
+
+        self.assertEqual(fake.tabs["Runs"][0]["last_am_review_sent_at"], "2026-06-09T00:00:00+00:00")
 
 
 class GmailApiClientTests(unittest.TestCase):
