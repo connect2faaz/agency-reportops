@@ -10,7 +10,7 @@ In plain English:
 4. Gmail sends the report to the account manager first.
 5. The account manager replies `Approved`.
 6. Gmail sends the approved report to the client.
-7. The app keeps checking report email threads for replies.
+7. The app keeps checking report email threads for replies and follows up with the account manager if a review waits too long.
 
 There is no dashboard or website to run. Google Sheets is the control panel.
 
@@ -213,7 +213,7 @@ Important columns:
 - `contact_email`: the client's email address.
 - `account_manager_email`: the person who approves the report before the client sees it.
 - `next_report_date`: the next date this client should be checked, like `2026-06-08`.
-- `run_now`: type `TRUE` to force a report on the next manual or scheduled run.
+- `run_now`: type `TRUE` to force a report on the next run. The app clears this after the approved report is sent to the client.
 - `paused`: type `TRUE` to stop reports for that client.
 
 Example row:
@@ -247,7 +247,7 @@ client_brightsmile_dental, BrightSmile Dental, Feb-2026, 3450, 131000, 3290, 2.5
 #### `Runs`
 
 ```text
-run_id, client_id, period, status, attempt_count, last_error, am_review_notes, html_report, gmail_thread_id, client_thread_id, created_at, updated_at, approved_at, delivered_at
+run_id, client_id, period, status, attempt_count, last_error, am_review_notes, html_report, gmail_thread_id, client_thread_id, created_at, updated_at, approved_at, delivered_at, last_am_review_sent_at
 ```
 
 You normally do not fill this tab manually. The app writes report run state here.
@@ -259,6 +259,7 @@ Useful columns:
 - `html_report`: the generated report body.
 - `gmail_thread_id`: the account-manager review email thread.
 - `client_thread_id`: the client email thread.
+- `last_am_review_sent_at`: the last time the app sent the first AM review or a follow-up reminder.
 
 #### `Messages`
 
@@ -377,11 +378,17 @@ After deployment:
 
 - Daily reports run at `0 0 * * *` UTC.
 - Gmail replies are checked every five minutes during UTC hours `09:00` through `18:59`.
-- `run_now` is only for manual runs.
+- `run_now` is for forcing manual runs. If it is left as `TRUE`, the next scheduled run can also pick it up.
 
 The account manager must reply `Approved` before the client gets the report.
 
 After the client report is sent, the app clears `run_now` and advances `next_report_date` by one month.
+
+If a daily run finds that a same-period report is already waiting for account-manager review, it does not regenerate the report and does not call OpenRouter again. If the account manager has not received an AM review or follow-up in more than 24 hours, the app sends a short follow-up in the same Gmail thread.
+
+This duplicate protection is only for the same report period. For example, an open `Feb-2026` AM review does not block a later `Mar-2026` report.
+
+Manual `run_now --client-id ... --period ...` is an explicit retry and can regenerate/resend that same-period AM review.
 
 ## Optional Developer Checks
 
@@ -420,6 +427,8 @@ Example: if the run is for `May-2026`, the client needs a `Metrics` row with `mo
 ### Report Is Waiting
 
 The account-manager review email was sent, but the client will not receive the report until the account manager replies with `Approved`.
+
+If the report is still waiting during the next daily run and the last AM review or reminder is more than 24 hours old, the app sends the account manager a follow-up. It does not create a new report for the same period unless you run an explicit manual retry.
 
 ### Google Auth Failed
 

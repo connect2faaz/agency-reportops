@@ -20,6 +20,8 @@ Daily UTC flow:
 
 Client schedule in Google Sheets -> due report detection -> metrics read from `Metrics` tab -> target reporting month plus previous month selected for the same `client_id` -> OpenRouter structured report generation -> fixed-structure HTML report email to account manager -> wait for Gmail reply.
 
+If a scheduled daily run finds an existing same-period `am_review` run for the client, do not call OpenRouter again and do not replace the existing report. If the latest AM review/reminder was sent more than 24 hours ago, send a short account-manager follow-up in the same Gmail thread with the hidden `run:{run_id}` marker. This suppression only applies to the same reporting period; an open prior-period AM review must not block a new later-period report.
+
 Reply polling flow:
 
 Active run Gmail thread IDs -> fetch only those Gmail threads -> ignore already processed Gmail message IDs -> match by headers/thread/body marker -> AM approval sends client report -> AM change request regenerates and resends to AM -> client replies become Q&A -> low-risk auto-reply in the same client email thread or high-risk AM review.
@@ -27,6 +29,8 @@ Active run Gmail thread IDs -> fetch only those Gmail threads -> ignore already 
 Metric periods are canonicalized to `Mon-YYYY` in code, so common Sheet values like `Feb-2026`, `Feb 2026`, `2026-02`, and `2/1/2026` can match the requested report period. If no matching metrics are found for the requested period, block the run with a clear `No metrics found` error and do not call OpenRouter or send email.
 
 After the approved report is actually sent to the client, clear the client's `run_now` flag and advance `next_report_date` by one month. Do not advance schedule state for blocked runs or account-manager-review-only sends.
+
+Manual `run_now --client-id ... --period ...` is an explicit override and may regenerate/resend a same-period AM review. AM change requests also regenerate and resend the AM review. Scheduled daily retries should not.
 
 Email identities are separate: `SYSTEM_SENDER_EMAIL` is the Gmail account used to send mail, while each client row's `account_manager_email` is the recipient who approves reports. The system does not infer the account manager from the sender email.
 
@@ -148,5 +152,6 @@ py -3.13 -m modal run modal_app.py::run_now
 - Keep reply matching strict: headers first, then stored Gmail thread IDs, then body fallback markers. Do not reintroduce the old "only active run" fallback.
 - Poll active Gmail threads directly. Do not rely on broad subject search for normal reply processing.
 - Keep hidden fallback markers in outgoing HTML, but do not show raw run IDs visibly to clients.
+- Keep same-period AM review suppression and 24-hour AM follow-up reminders. Do not reintroduce daily scheduled OpenRouter regeneration for an already open same-period `am_review` run.
 - Auto-answer only low-risk client Q&A. Escalate unhappy-client language and metric discrepancies to account-manager review.
 - Do not send reports when AI output validation fails.
