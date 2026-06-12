@@ -4,6 +4,7 @@ import unittest
 from reportops.ai import OpenRouterClient, StructuredOutputError
 from reportops.gmail_api import GmailApiClient
 from reportops.models import Client, MessageRecord, MetricRow, Run, RunStatus
+from reportops.pubsub import GmailPubSubAuthError, decode_gmail_pubsub_notification, handle_gmail_pubsub_push
 from reportops.sheets import GoogleSheetsStore, SheetClient
 
 
@@ -234,6 +235,88 @@ class GmailApiClientTests(unittest.TestCase):
         self.assertEqual(replies[0].body, "Approved")
         self.assertIn("/threads/thread_1", fetched_urls[0])
         self.assertNotIn("/messages?", fetched_urls[0])
+
+    def test_watch_mailbox_posts_gmail_watch_payload(self):
+        calls = []
+
+        def post(url, payload, headers):
+            calls.append((url, payload, headers))
+            return {"historyId": "1234567890", "expiration": "1760000000000"}
+
+        client = GmailApiClient(sender_email="sender@example.com", access_token_provider=lambda: "token", post_json=post)
+
+        result = client.watch_mailbox("projects/demo/topics/gmail-replies")
+
+        self.assertEqual(result, {"historyId": "1234567890", "expiration": "1760000000000"})
+        self.assertTrue(calls[0][0].endswith("/watch"))
+        self.assertEqual(
+            calls[0][1],
+            {
+                "topicName": "projects/demo/topics/gmail-replies",
+                "labelIds": ["INBOX"],
+                "labelFilterBehavior": "INCLUDE",
+            },
+        )
+        self.assertEqual(calls[0][2]["Authorization"], "Bearer token")
+
+
+class GmailPubSubTests(unittest.TestCase):
+    def test_decodes_gmail_pubsub_notification_data(self):
+        payload = {
+            "message": {
+                "data": "eyJlbWFpbEFkZHJlc3MiOiAic2VuZGVyQGV4YW1wbGUuY29tIiwgImhpc3RvcnlJZCI6ICIxMjM0NSJ9",
+                "messageId": "pubsub_1",
+                "publishTime": "2026-06-12T12:00:00Z",
+            },
+            "subscription": "projects/demo/subscriptions/reportops",
+        }
+
+        notification = decode_gmail_pubsub_notification(payload)
+
+        self.assertEqual(notification.email_address, "sender@example.com")
+        self.assertEqual(notification.history_id, "12345")
+        self.assertEqual(notification.pubsub_message_id, "pubsub_1")
+
+    def test_rejects_missing_pubsub_data(self):
+        with self.assertRaises(ValueError):
+            decode_gmail_pubsub_notification({"message": {"messageId": "pubsub_1"}})
+
+    def test_rejects_bad_pubsub_data(self):
+        with self.assertRaises(ValueError):
+            decode_gmail_pubsub_notification({"message": {"data": "not-valid-json"}})
+
+    def test_token_mismatch_rejects_without_spawning_processor(self):
+        spawned = []
+
+        with self.assertRaises(GmailPubSubAuthError):
+            handle_gmail_pubsub_push(
+                {"message": {"data": "e30"}},
+                token="wrong",
+                expected_token="secret",
+                spawn_processor=lambda _: spawned.append("spawned"),
+            )
+
+        self.assertEqual(spawned, [])
+
+    def test_valid_token_spawns_processor_after_decoding_notification(self):
+        spawned = []
+        payload = {
+            "message": {
+                "data": "eyJlbWFpbEFkZHJlc3MiOiAic2VuZGVyQGV4YW1wbGUuY29tIiwgImhpc3RvcnlJZCI6ICIxMjM0NSJ9",
+                "messageId": "pubsub_1",
+            }
+        }
+
+        response = handle_gmail_pubsub_push(
+            payload,
+            token="secret",
+            expected_token="secret",
+            spawn_processor=lambda notification: spawned.append(notification),
+        )
+
+        self.assertEqual(response["status"], "accepted")
+        self.assertEqual(response["history_id"], "12345")
+        self.assertEqual(spawned[0].email_address, "sender@example.com")
 
 
 class OpenRouterClientTests(unittest.TestCase):

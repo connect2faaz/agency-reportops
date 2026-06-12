@@ -147,6 +147,10 @@ SYSTEM_SENDER_EMAIL=
 OPENROUTER_API_KEY=
 OPENROUTER_MODEL=openai/gpt-oss-120b:free
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+
+# Optional instant Gmail reply detection.
+GMAIL_PUBSUB_TOPIC=
+GMAIL_PUBSUB_TOKEN=
 ```
 
 What each value means:
@@ -304,6 +308,8 @@ OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 
 If OpenRouter is unavailable, rate-limited, or returns invalid report data, the app blocks the run and does not send the report.
 
+`GMAIL_PUBSUB_TOPIC` and `GMAIL_PUBSUB_TOKEN` are optional. Leave them blank if you only want the normal five-minute Gmail reply checks.
+
 ## 5. Deploy To Modal
 
 Modal runs the workflow on a schedule in the cloud.
@@ -332,10 +338,10 @@ The easiest option is to create it from `.env`:
 modal secret create reportops-secrets --from-dotenv .env --force
 ```
 
-If your Modal CLI version does not support `--from-dotenv`, create it by passing the values manually:
+If your Modal CLI version does not support `--from-dotenv`, create it by passing the values manually. Include the optional Pub/Sub values only if you are enabling instant Gmail reply detection:
 
 ```powershell
-modal secret create reportops-secrets GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... GOOGLE_REFRESH_TOKEN=... GOOGLE_SHEETS_SPREADSHEET_ID=... SYSTEM_SENDER_EMAIL=... OPENROUTER_API_KEY=... OPENROUTER_MODEL=openai/gpt-oss-120b:free OPENROUTER_BASE_URL=https://openrouter.ai/api/v1 --force
+modal secret create reportops-secrets GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... GOOGLE_REFRESH_TOKEN=... GOOGLE_SHEETS_SPREADSHEET_ID=... SYSTEM_SENDER_EMAIL=... OPENROUTER_API_KEY=... OPENROUTER_MODEL=openai/gpt-oss-120b:free OPENROUTER_BASE_URL=https://openrouter.ai/api/v1 GMAIL_PUBSUB_TOPIC=... GMAIL_PUBSUB_TOKEN=... --force
 ```
 
 ### Deploy The App
@@ -344,7 +350,150 @@ modal secret create reportops-secrets GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=
 $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal deploy modal_app.py
 ```
 
-## 6. Run A Test Report
+## 6. Optional Instant Gmail Reply Detection
+
+The normal workflow checks Gmail replies every five minutes during the configured UTC business-hours window. For demos, you can also enable Gmail push notifications so replies trigger processing almost immediately.
+
+Gmail does not send the full email body to Modal. It sends a mailbox-change notification through Google Pub/Sub, then Modal fetches the relevant Gmail threads and uses the same reply-processing logic as the scheduled poller.
+
+### Set Up Google Pub/Sub
+
+Use the same Google Cloud project that owns the Gmail OAuth client.
+
+1. Open https://console.cloud.google.com/.
+2. Search for `Pub/Sub`.
+3. If Google asks you to enable the Pub/Sub API, enable it.
+4. Go to `Pub/Sub` -> `Topics`.
+5. Click `Create topic`.
+6. Use this Topic ID:
+
+```text
+reportops-gmail-push
+```
+
+7. Click `Create`.
+8. Copy the full topic name. It looks like this:
+
+```text
+projects/<project-id>/topics/reportops-gmail-push
+```
+
+This full value is your `GMAIL_PUBSUB_TOPIC`.
+
+### Let Gmail Publish To The Topic
+
+1. Open the `reportops-gmail-push` topic.
+2. Open `Permissions`.
+3. Click `Grant access`.
+4. In `New principals`, paste:
+
+```text
+gmail-api-push@system.gserviceaccount.com
+```
+
+5. In `Role`, choose:
+
+```text
+Pub/Sub Publisher
+```
+
+6. Save.
+
+### Create The Webhook Token
+
+The token is not from Google. You make it yourself. It is just a long secret string that protects the Modal webhook.
+
+Run this locally:
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Copy the output. That value is your `GMAIL_PUBSUB_TOKEN`.
+
+### Add The Values To Modal
+
+Add these values to `.env`:
+
+```text
+GMAIL_PUBSUB_TOPIC=projects/<project-id>/topics/reportops-gmail-push
+GMAIL_PUBSUB_TOKEN=<random-long-token>
+```
+
+Update the Modal secret:
+
+```powershell
+py -3.13 -m modal secret create reportops-secrets --from-dotenv .env --force
+```
+
+Deploy the app:
+
+```powershell
+$env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal deploy modal_app.py
+```
+
+The deployed webhook currently looks like this:
+
+```text
+https://connect2faaz--reportops-headless-gmail-pubsub-push.modal.run
+```
+
+If Modal shows a different `gmail_pubsub_push` URL during deploy, use the newer URL.
+
+### Create The Push Subscription
+
+1. Go back to Google Cloud Pub/Sub.
+2. Open `Subscriptions`.
+3. Click `Create subscription`.
+4. Subscription ID:
+
+```text
+reportops-gmail-push-sub
+```
+
+5. Topic: choose `reportops-gmail-push`.
+6. Delivery type: choose `Push`.
+7. Endpoint URL:
+
+```text
+<modal-endpoint-url>?token=<GMAIL_PUBSUB_TOKEN>
+```
+
+Example shape:
+
+```text
+https://connect2faaz--reportops-headless-gmail-pubsub-push.modal.run?token=<GMAIL_PUBSUB_TOKEN>
+```
+
+8. In `Lifetime options`, set `Expiration period` to:
+
+```text
+Never expire
+```
+
+9. Leave `Message retention duration` at 7 days.
+10. Leave `Retain acknowledged messages` unchecked.
+11. Create the subscription.
+
+### Start The Gmail Watch
+
+Run:
+
+```powershell
+$env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal run modal_app.py::renew_gmail_watch
+```
+
+Gmail watches expire, so the app also renews the watch daily at `0 1 * * *` UTC. Keep the scheduled five-minute reply checker enabled as the fallback.
+
+Important: `Never expire` on the Pub/Sub subscription keeps the subscription alive. It does not make the Gmail watch permanent. Gmail watches still expire separately, and the app renews them daily.
+
+Useful setup docs:
+
+- Gmail push notifications: https://developers.google.com/workspace/gmail/api/guides/push
+- Gmail `users.watch`: https://developers.google.com/workspace/gmail/api/reference/rest/v1/users/watch
+- Modal web endpoints: https://modal.com/docs/guide/webhooks
+
+## 7. Run A Test Report
 
 Run all due/manual clients:
 
@@ -378,6 +527,7 @@ After deployment:
 
 - Daily reports run at `0 0 * * *` UTC.
 - Gmail replies are checked every five minutes during UTC hours `09:00` through `18:59`.
+- Gmail push notification watches are renewed daily at `0 1 * * *` UTC when `GMAIL_PUBSUB_TOPIC` is configured.
 - `run_now` is for forcing manual runs. If it is left as `TRUE`, the next scheduled run can also pick it up.
 
 The account manager must reply `Approved` before the client gets the report.

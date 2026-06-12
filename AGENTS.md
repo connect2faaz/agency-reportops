@@ -4,7 +4,7 @@ Compressed handoff for agents working in this workspace.
 
 ## Workspace
 
-This is now a headless Python Modal workflow for agency report automation. Public-facing docs call the system `Agency's ReportOps`. It has no frontend, no Next.js runtime, and no SaaS dashboard. The product reads Google Sheets, generates HTML email reports with OpenRouter structured output, routes reports through Gmail account-manager approval, sends approved reports to clients, and polls Gmail replies every five minutes during the configured UTC business-hours window.
+This is now a headless Python Modal workflow for agency report automation. Public-facing docs call the system `Agency's ReportOps`. It has no frontend, no Next.js runtime, and no SaaS dashboard. The product reads Google Sheets, generates HTML email reports with OpenRouter structured output, routes reports through Gmail account-manager approval, sends approved reports to clients, polls Gmail replies every five minutes during the configured UTC business-hours window, and can optionally use Gmail Pub/Sub push notifications as an immediate reply-processing trigger.
 
 The previous TypeScript/Next implementation was removed. Do not reintroduce React, Next, local dashboard UI, local JSON workflow state, or npm scripts unless the user explicitly asks.
 
@@ -25,6 +25,10 @@ If a scheduled daily run finds an existing same-period `am_review` run for the c
 Reply polling flow:
 
 Active run Gmail thread IDs -> fetch only those Gmail threads -> ignore already processed Gmail message IDs -> match by headers/thread/body marker -> AM approval sends client report -> AM change request regenerates and resends to AM -> client replies become Q&A -> low-risk auto-reply in the same client email thread or high-risk AM review.
+
+Optional Gmail Pub/Sub push flow:
+
+Gmail mailbox change -> Google Pub/Sub topic -> Pub/Sub push subscription -> Modal `gmail_pubsub_push` webhook -> `process_gmail_push` background function -> existing `ReportingWorkflow.sync_replies()` logic. Pub/Sub notifications only wake the app up; they do not include the full email body, and v1 does not persist Gmail history cursors. Keep the five-minute poller as the reliable fallback and preserve processed Gmail message ID dedupe.
 
 Metric periods are canonicalized to `Mon-YYYY` in code, so common Sheet values like `Feb-2026`, `Feb 2026`, `2026-02`, and `2/1/2026` can match the requested report period. If no matching metrics are found for the requested period, block the run with a clear `No metrics found` error and do not call OpenRouter or send email.
 
@@ -48,13 +52,14 @@ Client Q&A uses a separate OpenRouter structured-output prompt with `intent`, `r
 
 ## Important Files
 
-- `modal_app.py`: Modal app, daily schedule, five-minute Gmail poller, manual `run_now`.
+- `modal_app.py`: Modal app, daily schedule, five-minute Gmail poller, Pub/Sub webhook/background processor, Gmail watch renewal, manual `run_now`.
 - `reportops/workflow.py`: Workflow state transitions and reply handling.
 - `reportops/models.py`: Dataclasses and status types.
 - `reportops/sheets.py`: Google Sheets API client and Sheet-backed store.
 - `reportops/gmail_api.py`: Gmail REST API client.
 - `reportops/gmail.py`: Email building, reply matching, thread-scoped polling helpers, and conservative classifiers.
 - `reportops/google_auth.py`: OAuth refresh-token helper.
+- `reportops/pubsub.py`: Gmail Pub/Sub notification decoding and shared-token webhook guard.
 - `reportops/ai.py`: OpenRouter structured-output client.
 - `tests_py/*.py`: Python unittest coverage.
 - `README.md`: Beginner-friendly setup guide for semi-technical/non-technical operators, including Google refresh-token setup, Sheet headers, OpenRouter setup, Modal deploy, troubleshooting, and final checklist.
@@ -96,7 +101,21 @@ OPENROUTER_MODEL=openai/gpt-oss-120b:free
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 ```
 
+Optional Modal secret values for instant Gmail reply detection:
+
+```text
+GMAIL_PUBSUB_TOPIC=projects/<project-id>/topics/reportops-gmail-push
+GMAIL_PUBSUB_TOKEN=
+```
+
 Google OAuth needs Gmail send/modify/read scopes and Google Sheets read/write scopes.
+
+Gmail Pub/Sub setup notes:
+
+- Pub/Sub topic should grant `gmail-api-push@system.gserviceaccount.com` the `Pub/Sub Publisher` role.
+- Pub/Sub push subscription should point to `https://connect2faaz--reportops-headless-gmail-pubsub-push.modal.run?token=<GMAIL_PUBSUB_TOKEN>`.
+- Set the Pub/Sub subscription expiration period to `Never expire`; this only keeps the subscription alive.
+- Gmail watches still expire separately. Gmail requires watch renewal at least every seven days; this app renews daily.
 
 ## Commands
 
@@ -124,6 +143,12 @@ Deploy:
 $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal deploy modal_app.py
 ```
 
+Renew Gmail Pub/Sub watch manually:
+
+```powershell
+$env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal run modal_app.py::renew_gmail_watch
+```
+
 Manual run:
 
 ```powershell
@@ -140,6 +165,7 @@ py -3.13 -m modal run modal_app.py::run_now
 
 - Daily reports: `0 0 * * *` UTC.
 - Gmail reply polling: `*/5 9-18 * * *`, meaning every five minutes during UTC hours `09:00` through `18:59`.
+- Gmail watch renewal: `0 1 * * *` UTC. This keeps optional Gmail Pub/Sub push notifications active.
 - `run_now` is a manual Modal function only; it is not scheduled.
 
 ## Guardrails
@@ -151,6 +177,9 @@ py -3.13 -m modal run modal_app.py::run_now
 - Preserve duplicate protection through processed Gmail message IDs.
 - Keep reply matching strict: headers first, then stored Gmail thread IDs, then body fallback markers. Do not reintroduce the old "only active run" fallback.
 - Poll active Gmail threads directly. Do not rely on broad subject search for normal reply processing.
+- Treat Gmail Pub/Sub as a wake-up accelerator, not the source of email contents. Do not remove the scheduled poller fallback.
+- Protect the Pub/Sub webhook with `GMAIL_PUBSUB_TOKEN`; do not make it unauthenticated.
+- Do not persist or rely on Gmail history IDs in v1 unless a deliberate history-cursor design is added.
 - Keep hidden fallback markers in outgoing HTML, but do not show raw run IDs visibly to clients.
 - Keep same-period AM review suppression and 24-hour AM follow-up reminders. Do not reintroduce daily scheduled OpenRouter regeneration for an already open same-period `am_review` run.
 - Auto-answer only low-risk client Q&A. Escalate unhappy-client language and metric discrepancies to account-manager review.

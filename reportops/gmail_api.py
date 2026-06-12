@@ -13,6 +13,7 @@ from .google_auth import refresh_google_access_token
 
 GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 GMAIL_THREADS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/threads"
+GMAIL_WATCH_URL = "https://gmail.googleapis.com/gmail/v1/users/me/watch"
 DEFAULT_REPLY_QUERY = (
     'newer_than:30d '
     '(subject:"performance report" OR subject:"report ready for review" OR subject:"AM review needed for client reply")'
@@ -83,6 +84,18 @@ class GmailApiClient:
         self._post_json(
             f"{GMAIL_MESSAGES_URL}/{parse.quote(message_id)}/modify",
             {"removeLabelIds": ["UNREAD"]},
+            {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+
+    def watch_mailbox(self, topic_name: str) -> dict[str, Any]:
+        token = self.access_token_provider()
+        return self._post_json(
+            GMAIL_WATCH_URL,
+            {
+                "topicName": topic_name,
+                "labelIds": ["INBOX"],
+                "labelFilterBehavior": "INCLUDE",
+            },
             {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         )
 
