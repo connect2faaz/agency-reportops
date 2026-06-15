@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import modal_app
 from reportops.ai import OpenRouterClient
-from reportops.models import Client, MetricRow
+from reportops.models import Client, MetricRow, Run, RunStatus
 from reportops.workflow import InMemorySheetStore, ReportingWorkflow
 
 
@@ -29,6 +29,9 @@ class ModalEntrypointTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(modal_app, "scheduled_tick"))
 
+    def test_run_now_has_extended_modal_timeout_for_multi_client_generation(self):
+        self.assertGreaterEqual(modal_app.FUNCTION_TIMEOUTS["run_now"], 3600)
+
     def test_run_now_with_client_id_only_runs_that_client_even_when_others_are_due(self):
         store = InMemorySheetStore(
             clients=[
@@ -47,6 +50,48 @@ class ModalEntrypointTests(unittest.TestCase):
             modal_app.run_now(client_id="client_a", period="Feb-2026")
 
         self.assertEqual([run.client_id for run in store.runs], ["client_a"])
+
+    def test_run_now_without_client_id_forces_non_paused_clients_even_with_existing_period_runs(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client("client_a", "Client A", "Ava", "a@example.com", "am@example.com", "monthly", date(2026, 7, 1)),
+                Client(
+                    "client_paused",
+                    "Paused Client",
+                    "Pat",
+                    "p@example.com",
+                    "am@example.com",
+                    "monthly",
+                    date(2026, 1, 1),
+                    paused=True,
+                ),
+            ],
+            metrics=[
+                MetricRow("client_a", "Client A", "Feb-2026", 100, 1000, 100, 10, 5, 20, 2, 2, 500, 5),
+                MetricRow("client_paused", "Paused Client", "Feb-2026", 100, 1000, 100, 10, 5, 20, 2, 2, 500, 5),
+            ],
+            runs=[
+                Run(
+                    run_id="run_existing",
+                    client_id="client_a",
+                    period="Feb-2026",
+                    status=RunStatus.BLOCKED,
+                    attempt_count=1,
+                    last_error="Previous failure",
+                )
+            ],
+        )
+        store.flush = lambda: None
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_report(), gmail=store.gmail)
+
+        with patch.object(modal_app, "_build_workflow", return_value=(workflow, store)):
+            modal_app.run_now(period="Feb-2026")
+
+        self.assertEqual([run.client_id for run in store.runs], ["client_a"])
+        self.assertEqual(store.runs[0].status, RunStatus.AM_REVIEW)
+        self.assertEqual(store.runs[0].attempt_count, 2)
+        self.assertEqual(store.runs[0].last_error, "")
+        self.assertEqual(len(store.gmail.sent_messages), 1)
 
     def test_process_gmail_push_runs_existing_reply_sync_and_flushes_store(self):
         class SyncCapturingWorkflow:

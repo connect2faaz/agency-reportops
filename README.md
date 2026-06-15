@@ -495,7 +495,7 @@ Useful setup docs:
 
 ## 7. Run A Test Report
 
-Run all due/manual clients:
+Run all non-paused clients, whether they are due or not:
 
 ```powershell
 py -3.13 -m modal run modal_app.py::run_now
@@ -521,6 +521,8 @@ py -3.13 -m modal run modal_app.py::run_now --client-id client_brightsmile_denta
 
 Important: if you do not pass `--period`, the app uses the previous month. For example, a run in June looks for `May-2026` metrics. If there are no matching metric rows, no email is sent.
 
+Manual all-client runs can take several minutes because reports are generated one client at a time. The `run_now` Modal function has a one-hour timeout so slower OpenRouter responses do not stop the batch after five minutes.
+
 ## How The Schedule Works
 
 After deployment:
@@ -528,7 +530,7 @@ After deployment:
 - Daily reports run at `0 0 * * *` UTC.
 - Gmail replies are checked every five minutes during UTC hours `09:00` through `18:59`.
 - Gmail push notification watches are renewed daily at `0 1 * * *` UTC when `GMAIL_PUBSUB_TOPIC` is configured.
-- `run_now` is for forcing manual runs. If it is left as `TRUE`, the next scheduled run can also pick it up.
+- `run_now` is for forcing scheduled runs. The manual `run_now` Modal command runs non-paused clients even if this Sheet value is blank.
 
 The account manager must reply `Approved` before the client gets the report.
 
@@ -538,7 +540,7 @@ If a daily run finds that a same-period report is already waiting for account-ma
 
 This duplicate protection is only for the same report period. For example, an open `Feb-2026` AM review does not block a later `Mar-2026` report.
 
-Manual `run_now --client-id ... --period ...` is an explicit retry and can regenerate/resend that same-period AM review.
+Manual `run_now` commands are explicit retries and can regenerate/resend same-period AM reviews. Without `--client-id`, the command runs every non-paused client.
 
 ## Optional Developer Checks
 
@@ -563,7 +565,7 @@ python -m compileall -q reportops modal_app.py
 Check these first:
 
 - The report period has matching rows in `Metrics`.
-- The client is due, or `run_now` is set to `TRUE`.
+- For scheduled runs, the client is due or `run_now` is set to `TRUE`. For manual `run_now`, the client is not paused.
 - `account_manager_email` is correct.
 - `SYSTEM_SENDER_EMAIL` is the Gmail account that was authorized.
 - The run was not blocked in the `Runs` tab.

@@ -17,6 +17,10 @@ SCHEDULE_PLAN = {
     "run_now": None,
 }
 
+FUNCTION_TIMEOUTS = {
+    "run_now": 3600,
+}
+
 
 try:
     import modal
@@ -115,15 +119,16 @@ def gmail_pubsub_push(item: dict, token: str | None = None) -> dict[str, str]:
         raise _http_error(400, str(error)) from error
 
 
-@modal_function()
+@modal_function(timeout=FUNCTION_TIMEOUTS["run_now"])
 def run_now(client_id: str | None = None, period: str | None = None) -> None:
     workflow, store = _build_workflow()
+    report_period = period or os.getenv("REPORTOPS_PERIOD")
     if client_id:
-        workflow.run_client_report(client_id, today=date.today(), period=period or os.getenv("REPORTOPS_PERIOD"))
+        workflow.run_client_report(client_id, today=date.today(), period=report_period)
     else:
         for client in store.clients:
-            client.run_now = True
-        workflow.run_due_reports(today=date.today(), period=period or os.getenv("REPORTOPS_PERIOD"))
+            if not client.paused:
+                workflow.run_client_report(client.client_id, today=date.today(), period=report_period)
     store.flush()
 
 

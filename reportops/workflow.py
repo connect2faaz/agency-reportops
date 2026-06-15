@@ -139,8 +139,13 @@ class ReportingWorkflow:
         self._start_or_retry_report(client, period or self._default_period(today), force=True)
 
     def sync_replies(self) -> None:
+        outbound_message_ids = {
+            message.gmail_message_id for message in self.store.messages if message.message_type != "processed_reply"
+        }
         for inbound in self.gmail.list_recent_replies(thread_ids=self._active_thread_ids()):
             if inbound.message_id in self.store.processed_message_ids:
+                continue
+            if inbound.message_id in outbound_message_ids:
                 continue
             if not is_reply(inbound):
                 continue
@@ -277,10 +282,10 @@ class ReportingWorkflow:
         body = f"{run.html_report}<hr>{self._hidden_reference(f'client:{run.run_id}')}"
         sent = self.gmail.send_html(
             to=client.contact_email,
-            subject=f"{client.client_name} {run.period} performance report",
+            subject=self._client_report_subject(client, run),
             html_body=body,
             headers={
-                "Message-ID": f"<reportops-client-{run.run_id}@local.reportops>",
+                "Message-ID": self._client_report_message_id(run),
                 "X-ReportOps-Run-Id": run.run_id,
                 "X-ReportOps-Client-Id": client.client_id,
                 "X-ReportOps-Message-Type": "client_delivery",
@@ -295,7 +300,7 @@ class ReportingWorkflow:
                 run_id=run.run_id,
                 message_type="client_delivery",
                 to=client.contact_email,
-                subject=f"{client.client_name} {run.period} performance report",
+                subject=self._client_report_subject(client, run),
                 gmail_message_id=sent["id"],
                 gmail_thread_id=sent["thread_id"],
                 status="sent",
@@ -337,9 +342,11 @@ class ReportingWorkflow:
             question.sent_at = utc_now()
             self.gmail.send_html(
                 to=client.contact_email,
-                subject="Re: performance report",
+                subject=self._client_report_reply_subject(client, run),
                 html_body=f"{answer}{self._hidden_reference(f'client:{run.run_id}')}",
                 headers={
+                    "In-Reply-To": self._client_report_message_id(run),
+                    "References": self._client_report_message_id(run),
                     "X-ReportOps-Run-Id": run.run_id,
                     "X-ReportOps-Client-Id": client.client_id,
                     "X-ReportOps-Message-Type": "question_answer",
@@ -373,9 +380,11 @@ class ReportingWorkflow:
                 question.sent_at = utc_now()
                 self.gmail.send_html(
                     to=client.contact_email,
-                    subject="Re: performance report",
+                    subject=self._client_report_reply_subject(client, run),
                     html_body=f"{question.answer_html}{self._hidden_reference(f'client:{run.run_id}')}",
                     headers={
+                        "In-Reply-To": self._client_report_message_id(run),
+                        "References": self._client_report_message_id(run),
                         "X-ReportOps-Run-Id": run.run_id,
                         "X-ReportOps-Client-Id": client.client_id,
                         "X-ReportOps-Message-Type": "question_answer",
@@ -406,3 +415,15 @@ class ReportingWorkflow:
     @staticmethod
     def _hidden_reference(marker: str) -> str:
         return f'<div style="{HIDDEN_REFERENCE_STYLE}" aria-hidden="true">Reference: {marker}</div>'
+
+    @staticmethod
+    def _client_report_message_id(run: Run) -> str:
+        return f"<reportops-client-{run.run_id}@local.reportops>"
+
+    @staticmethod
+    def _client_report_subject(client: Client, run: Run) -> str:
+        return f"{client.client_name} {run.period} performance report"
+
+    @classmethod
+    def _client_report_reply_subject(cls, client: Client, run: Run) -> str:
+        return f"Re: {cls._client_report_subject(client, run)}"

@@ -10,7 +10,7 @@ from reportops.gmail import (
     classify_client_question_risk,
     extract_run_id_from_reply,
 )
-from reportops.models import Client, MetricRow, QuestionAnswerOutput, Run, RunStatus
+from reportops.models import Client, MessageRecord, MetricRow, Question, QuestionAnswerOutput, Run, RunStatus
 from reportops.workflow import InMemorySheetStore, ReportingWorkflow, select_due_clients
 
 
@@ -723,6 +723,107 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertIn("display:none", store.gmail.sent_messages[0]["body"])
         self.assertEqual(store.processed_message_ids, ["gmail_1"])
 
+    def test_sync_replies_ignores_outbound_system_follow_up_in_am_thread(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.AM_REVIEW,
+                    html_report="<h1>Report</h1>",
+                    gmail_thread_id="thread_1",
+                )
+            ],
+        )
+        store.messages = [
+            MessageRecord(
+                message_id="message_followup",
+                run_id="run_1",
+                message_type="account_manager_follow_up",
+                to="am@example.com",
+                subject="Re: BrightSmile Dental report ready for review",
+                gmail_message_id="gmail_followup",
+                gmail_thread_id="thread_1",
+                status="sent",
+            )
+        ]
+        store.gmail.inbound_messages = [
+            GmailInboundMessage(
+                message_id="gmail_followup",
+                thread_id="thread_1",
+                subject="Re: BrightSmile Dental report ready for review",
+                from_email="system@example.com",
+                headers={"references": "<reportops-run_1@local.reportops>"},
+                body="Please reply Approved to send, or reply with requested changes.",
+                snippet="Please reply Approved",
+                received_at=datetime.now(timezone.utc),
+            )
+        ]
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_report(), gmail=store.gmail)
+
+        workflow.sync_replies()
+
+        self.assertEqual(store.runs[0].status, RunStatus.AM_REVIEW)
+        self.assertEqual(store.gmail.sent_messages, [])
+        self.assertEqual(store.processed_message_ids, [])
+
+    def test_am_approval_from_system_sender_address_still_sends_client_email(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="system@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.AM_REVIEW,
+                    html_report="<h1>Report</h1>",
+                    gmail_thread_id="thread_1",
+                )
+            ],
+        )
+        store.gmail.inbound_messages = [
+            GmailInboundMessage(
+                message_id="gmail_approval",
+                thread_id="thread_1",
+                subject="Re: BrightSmile Dental report ready for review",
+                from_email="System User <system@example.com>",
+                headers={"references": "<reportops-run_1@local.reportops>"},
+                body="Approved",
+                snippet="Approved",
+                received_at=datetime.now(timezone.utc),
+            )
+        ]
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_report(), gmail=store.gmail)
+
+        workflow.sync_replies()
+
+        self.assertEqual(store.runs[0].status, RunStatus.CLIENT_DELIVERED)
+        self.assertEqual(len(store.gmail.sent_messages), 1)
+        self.assertEqual(store.gmail.sent_messages[0]["to"], "ava@example.com")
+        self.assertEqual(store.processed_message_ids, ["gmail_approval"])
+
     def test_client_schedule_updates_after_client_report_is_sent(self):
         store = InMemorySheetStore(
             clients=[
@@ -869,6 +970,9 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertIn("Search had the best ROAS", store.questions[0].answer_html)
         self.assertEqual(store.gmail.sent_messages[0]["to"], "ava@example.com")
         self.assertEqual(store.gmail.sent_messages[0]["thread_id"], "client_thread")
+        self.assertEqual(store.gmail.sent_messages[0]["subject"], "Re: BrightSmile Dental Feb-2026 performance report")
+        self.assertIn("In-Reply-To: <reportops-client-run_1@local.reportops>", store.gmail.sent_messages[0]["raw"])
+        self.assertIn("References: <reportops-client-run_1@local.reportops>", store.gmail.sent_messages[0]["raw"])
         self.assertEqual(store.gmail.sent_messages[1]["to"], "am@example.com")
 
     def test_client_question_ai_high_risk_routes_to_am_review(self):
@@ -915,6 +1019,66 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertEqual(store.questions[0].status, "needs_review")
         self.assertEqual(store.runs[0].status, RunStatus.REPLY_REVIEW)
         self.assertEqual(store.gmail.sent_messages[0]["to"], "am@example.com")
+
+    def test_am_approved_client_question_answer_replies_in_original_client_thread(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.REPLY_REVIEW,
+                    html_report="<h1>Report</h1>",
+                    gmail_thread_id="am_thread",
+                    client_thread_id="client_thread",
+                )
+            ],
+        )
+        store.questions = [
+            Question(
+                question_id="question_1",
+                run_id="run_1",
+                client_id="client_1",
+                question="Can you explain ROAS?",
+                risk_level="high",
+                answer_html="<p>ROAS means return on ad spend.</p>",
+                status="needs_review",
+            )
+        ]
+        store.gmail.inbound_messages = [
+            GmailInboundMessage(
+                message_id="gmail_am_approval",
+                thread_id="am_thread",
+                subject="Re: AM review needed for client reply",
+                from_email="am@example.com",
+                headers={"references": "<reportops-run_1@local.reportops>"},
+                body="Approved",
+                snippet="Approved",
+                received_at=datetime.now(timezone.utc),
+            )
+        ]
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_report(), gmail=store.gmail)
+
+        workflow.sync_replies()
+
+        self.assertEqual(store.questions[0].status, "sent")
+        self.assertEqual(store.runs[0].status, RunStatus.CLIENT_DELIVERED)
+        self.assertEqual(store.gmail.sent_messages[0]["to"], "ava@example.com")
+        self.assertEqual(store.gmail.sent_messages[0]["thread_id"], "client_thread")
+        self.assertEqual(store.gmail.sent_messages[0]["subject"], "Re: BrightSmile Dental Feb-2026 performance report")
+        self.assertIn("In-Reply-To: <reportops-client-run_1@local.reportops>", store.gmail.sent_messages[0]["raw"])
+        self.assertIn("References: <reportops-client-run_1@local.reportops>", store.gmail.sent_messages[0]["raw"])
 
     def test_email_builder_includes_html_and_tracking_headers(self):
         raw = build_raw_email(

@@ -34,7 +34,7 @@ Metric periods are canonicalized to `Mon-YYYY` in code, so common Sheet values l
 
 After the approved report is actually sent to the client, clear the client's `run_now` flag and advance `next_report_date` by one month. Do not advance schedule state for blocked runs or account-manager-review-only sends.
 
-Manual `run_now --client-id ... --period ...` is an explicit override and may regenerate/resend a same-period AM review. AM change requests also regenerate and resend the AM review. Scheduled daily retries should not.
+Manual `run_now` is an explicit override and may regenerate/resend same-period AM reviews. With `--client-id`, it runs only that client. Without `--client-id`, it runs every non-paused client regardless of `next_report_date` or the Sheet `run_now` flag. AM change requests also regenerate and resend the AM review. Scheduled daily retries should not.
 
 Email identities are separate: `SYSTEM_SENDER_EMAIL` is the Gmail account used to send mail, while each client row's `account_manager_email` is the recipient who approves reports. The system does not infer the account manager from the sender email.
 
@@ -155,11 +155,13 @@ Manual run:
 py -3.13 -m modal run modal_app.py::run_now --client-id client_brightsmile_dental --period Feb-2026
 ```
 
-Manual run for all due/manual clients:
+Manual run for all non-paused clients, whether due or not:
 
 ```powershell
 py -3.13 -m modal run modal_app.py::run_now
 ```
+
+Manual all-client runs generate reports sequentially and can take several minutes. `run_now` has an explicit one-hour Modal timeout; keep it longer than the default five-minute timeout unless the workflow is redesigned for per-client parallelism.
 
 ## Modal Schedules
 
