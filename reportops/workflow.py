@@ -340,19 +340,7 @@ class ReportingWorkflow:
         if risk == "low":
             question.status = "auto_replied"
             question.sent_at = utc_now()
-            self.gmail.send_html(
-                to=client.contact_email,
-                subject=self._client_report_reply_subject(client, run),
-                html_body=f"{answer}{self._hidden_reference(f'client:{run.run_id}')}",
-                headers={
-                    "In-Reply-To": self._client_report_message_id(run),
-                    "References": self._client_report_message_id(run),
-                    "X-ReportOps-Run-Id": run.run_id,
-                    "X-ReportOps-Client-Id": client.client_id,
-                    "X-ReportOps-Message-Type": "question_answer",
-                },
-                thread_id=run.client_thread_id,
-            )
+            self._send_client_question_answer(client, run, answer)
         else:
             question.status = "needs_review"
             run.status = RunStatus.REPLY_REVIEW
@@ -378,22 +366,38 @@ class ReportingWorkflow:
                 client = self.store.client_by_id(run.client_id)
                 question.status = "sent"
                 question.sent_at = utc_now()
-                self.gmail.send_html(
-                    to=client.contact_email,
-                    subject=self._client_report_reply_subject(client, run),
-                    html_body=f"{question.answer_html}{self._hidden_reference(f'client:{run.run_id}')}",
-                    headers={
-                        "In-Reply-To": self._client_report_message_id(run),
-                        "References": self._client_report_message_id(run),
-                        "X-ReportOps-Run-Id": run.run_id,
-                        "X-ReportOps-Client-Id": client.client_id,
-                        "X-ReportOps-Message-Type": "question_answer",
-                    },
-                    thread_id=run.client_thread_id,
-                )
+                self._send_client_question_answer(client, run, question.answer_html)
                 run.status = RunStatus.CLIENT_DELIVERED
                 break
         self.store.record_processed(inbound.message_id)
+
+    def _send_client_question_answer(self, client: Client, run: Run, answer_html: str) -> None:
+        subject = self._client_report_reply_subject(client, run)
+        sent = self.gmail.send_html(
+            to=client.contact_email,
+            subject=subject,
+            html_body=f"{answer_html}{self._hidden_reference(f'client:{run.run_id}')}",
+            headers={
+                "In-Reply-To": self._client_report_message_id(run),
+                "References": self._client_report_message_id(run),
+                "X-ReportOps-Run-Id": run.run_id,
+                "X-ReportOps-Client-Id": client.client_id,
+                "X-ReportOps-Message-Type": "question_answer",
+            },
+            thread_id=run.client_thread_id,
+        )
+        self.store.save_message(
+            MessageRecord(
+                message_id=new_id("message"),
+                run_id=run.run_id,
+                message_type="question_answer",
+                to=client.contact_email,
+                subject=subject,
+                gmail_message_id=sent["id"],
+                gmail_thread_id=sent["thread_id"],
+                status="sent",
+            )
+        )
 
     @staticmethod
     def _default_period(today: date) -> str:

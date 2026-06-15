@@ -975,6 +975,69 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertIn("References: <reportops-client-run_1@local.reportops>", store.gmail.sent_messages[0]["raw"])
         self.assertEqual(store.gmail.sent_messages[1]["to"], "am@example.com")
 
+    def test_client_question_auto_reply_is_recorded_and_not_processed_again(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.CLIENT_DELIVERED,
+                    html_report="<h1>Report</h1>",
+                    client_thread_id="client_thread",
+                )
+            ],
+        )
+        store.gmail.inbound_messages = [
+            GmailInboundMessage(
+                message_id="gmail_client_question",
+                thread_id="client_thread",
+                subject="Re: BrightSmile Dental Feb-2026 performance report",
+                from_email="ava@example.com",
+                headers={"references": "<reportops-client-run_1@local.reportops>"},
+                body="What is ad spend?",
+                snippet="",
+                received_at=datetime.now(timezone.utc),
+            )
+        ]
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_report(), gmail=store.gmail)
+
+        workflow.sync_replies()
+        sent_answer = store.gmail.sent_messages[0]
+        store.gmail.inbound_messages = [
+            GmailInboundMessage(
+                message_id=sent_answer["id"],
+                thread_id=sent_answer["thread_id"],
+                subject=sent_answer["subject"],
+                from_email="connect2faaz@gmail.com",
+                headers={"references": "<reportops-client-run_1@local.reportops>"},
+                body=sent_answer["body"],
+                snippet="",
+                received_at=datetime.now(timezone.utc),
+            )
+        ]
+
+        workflow.sync_replies()
+
+        self.assertEqual(len(store.questions), 1)
+        self.assertEqual(store.questions[0].question, "What is ad spend?")
+        self.assertEqual(
+            [message.message_type for message in store.messages],
+            ["question_answer"],
+        )
+        self.assertEqual(store.processed_message_ids, ["gmail_client_question"])
+
     def test_client_question_ai_high_risk_routes_to_am_review(self):
         store = InMemorySheetStore(
             clients=[
