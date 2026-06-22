@@ -8,7 +8,7 @@ from typing import Any, Protocol
 from urllib import parse, request
 
 from .google_auth import refresh_google_access_token
-from .models import Client, MessageRecord, MetricRow, Question, Run, RunStatus, parse_datetime
+from .models import Client, MessageRecord, MetricRow, Question, Run, RunStatus, parse_datetime, utc_now
 from .workflow import InMemorySheetStore
 
 
@@ -213,6 +213,10 @@ def _run_from_row(row: dict[str, str]) -> Run:
         html_report=row.get("html_report", ""),
         gmail_thread_id=row.get("gmail_thread_id", ""),
         client_thread_id=row.get("client_thread_id", ""),
+        created_at=parse_datetime(row.get("created_at")) or utc_now(),
+        updated_at=parse_datetime(row.get("updated_at")) or utc_now(),
+        approved_at=parse_datetime(row.get("approved_at")),
+        delivered_at=parse_datetime(row.get("delivered_at")),
         last_am_review_sent_at=parse_datetime(row.get("last_am_review_sent_at")),
     )
 

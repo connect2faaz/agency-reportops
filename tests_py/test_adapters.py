@@ -1,8 +1,11 @@
 from datetime import date, datetime, timezone
+from io import BytesIO
 import unittest
+from urllib.error import HTTPError
 
 from reportops.ai import OpenRouterClient, StructuredOutputError
 from reportops.gmail_api import GmailApiClient
+from reportops.google_auth import refresh_google_access_token
 from reportops.models import Client, MessageRecord, MetricRow, Run, RunStatus
 from reportops.pubsub import GmailPubSubAuthError, decode_gmail_pubsub_notification, handle_gmail_pubsub_push
 from reportops.sheets import GoogleSheetsStore, SheetClient
@@ -51,6 +54,44 @@ class FakeSheetClient(SheetClient):
 
     def replace_rows(self, tab_name: str, rows: list[dict[str, str]]) -> None:
         self.tabs[tab_name] = rows
+
+
+class GoogleAuthTests(unittest.TestCase):
+    def test_refresh_google_access_token_retries_transient_http_errors(self):
+        calls = []
+
+        def post_form(url, form):
+            calls.append((url, form))
+            if len(calls) < 3:
+                raise HTTPError(url, 503, "Service Unavailable", hdrs=None, fp=BytesIO(b"unavailable"))
+            return {"access_token": "access_123"}
+
+        token = refresh_google_access_token(
+            client_id="client",
+            client_secret="secret",
+            refresh_token="refresh",
+            http_post_form=post_form,
+            retry_delays=(0, 0),
+        )
+
+        self.assertEqual(token, "access_123")
+        self.assertEqual(len(calls), 3)
+
+    def test_refresh_google_access_token_wraps_final_http_error(self):
+        def post_form(url, form):
+            raise HTTPError(url, 503, "Service Unavailable", hdrs=None, fp=BytesIO(b"unavailable"))
+
+        with self.assertRaises(RuntimeError) as context:
+            refresh_google_access_token(
+                client_id="client",
+                client_secret="secret",
+                refresh_token="refresh",
+                http_post_form=post_form,
+                retry_delays=(0, 0),
+            )
+
+        self.assertIn("Google OAuth refresh failed after 3 attempts", str(context.exception))
+        self.assertIsNone(context.exception.__cause__)
 
 
 class GoogleSheetsStoreTests(unittest.TestCase):
@@ -121,6 +162,33 @@ class GoogleSheetsStoreTests(unittest.TestCase):
         store.flush()
 
         self.assertEqual(fake.tabs["Runs"][0]["last_am_review_sent_at"], "2026-06-09T00:00:00+00:00")
+
+    def test_preserves_run_timestamps_when_rewriting_sheet_rows(self):
+        fake = FakeSheetClient()
+        fake.tabs["Runs"] = [
+            {
+                "run_id": "run_1",
+                "client_id": "client_1",
+                "period": "Feb-2026",
+                "status": "client_delivered",
+                "attempt_count": "1",
+                "created_at": "2026-06-01T10:00:00+00:00",
+                "updated_at": "2026-06-02T11:00:00+00:00",
+                "approved_at": "2026-06-02T10:30:00+00:00",
+                "delivered_at": "2026-06-02T11:00:00+00:00",
+                "last_am_review_sent_at": "2026-06-01T10:05:00+00:00",
+            }
+        ]
+        store = GoogleSheetsStore(fake)
+
+        store.flush()
+
+        row = fake.tabs["Runs"][0]
+        self.assertEqual(row["created_at"], "2026-06-01T10:00:00+00:00")
+        self.assertEqual(row["updated_at"], "2026-06-02T11:00:00+00:00")
+        self.assertEqual(row["approved_at"], "2026-06-02T10:30:00+00:00")
+        self.assertEqual(row["delivered_at"], "2026-06-02T11:00:00+00:00")
+        self.assertEqual(row["last_am_review_sent_at"], "2026-06-01T10:05:00+00:00")
 
 
 class GmailApiClientTests(unittest.TestCase):
