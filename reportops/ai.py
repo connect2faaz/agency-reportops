@@ -173,7 +173,16 @@ class OpenRouterClient:
             try:
                 return self.parse_report_payload(retry_response)
             except StructuredOutputError as retry_error:
-                raise StructuredOutputError(f"{retry_error}; first attempt also failed with: {first_error}") from retry_error
+                repair_payload = self._report_repair_payload(client, metrics, review_notes, first_error, retry_error)
+                repair_response = self._http_post(f"{self.base_url}/chat/completions", repair_payload, self._headers())
+                try:
+                    return self.parse_report_payload(repair_response)
+                except StructuredOutputError as repair_error:
+                    raise StructuredOutputError(
+                        f"final repair attempt failed with: {repair_error}; "
+                        f"retry attempt failed with: {retry_error}; "
+                        f"first attempt also failed with: {first_error}"
+                    ) from repair_error
 
     def _report_payload(self, client: Client, metrics: list[MetricRow], review_notes: list[str]) -> dict[str, Any]:
         payload = {
@@ -215,6 +224,32 @@ class OpenRouterClient:
                 },
             },
         }
+        return payload
+
+    def _report_repair_payload(
+        self,
+        client: Client,
+        metrics: list[MetricRow],
+        review_notes: list[str],
+        first_error: StructuredOutputError,
+        retry_error: StructuredOutputError,
+    ) -> dict[str, Any]:
+        payload = self._report_payload(client, metrics, review_notes)
+        payload["messages"].append(
+            {
+                "role": "user",
+                "content": (
+                    "FINAL REPAIR ATTEMPT.\n"
+                    f"The first response failed validation with: {first_error}.\n"
+                    f"The second response failed validation with: {retry_error}.\n"
+                    "Return exactly one JSON object and nothing else. The object must include these five keys: "
+                    "executive_summary, highlights, concerns, next_actions, html_report. "
+                    "highlights, concerns, and next_actions must be arrays of strings. "
+                    "concerns may be an empty array. html_report must be a non-empty string containing "
+                    "the required div.report-shell email report HTML."
+                ),
+            }
+        )
         return payload
 
     def draft_question_answer(self, client: Client, question: str, run_html: str) -> QuestionAnswerOutput:

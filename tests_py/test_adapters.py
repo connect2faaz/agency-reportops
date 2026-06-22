@@ -442,6 +442,59 @@ class OpenRouterClientTests(unittest.TestCase):
         self.assertEqual(output.html_report, "<h1>Report</h1>")
         self.assertEqual(len(calls), 2)
 
+    def test_generate_report_uses_final_repair_prompt_after_two_invalid_outputs(self):
+        calls = []
+
+        def post(url, payload, headers):
+            calls.append(payload)
+            if len(calls) < 3:
+                return {"choices": [{"message": {"content": "{}"}}]}
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"executive_summary":"Summary","highlights":["Win"],'
+                                '"concerns":[],"next_actions":["Action"],'
+                                '"html_report":"<h1>Report</h1>"}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+        client = OpenRouterClient(api_key="fake", http_post=post)
+        output = client.generate_report(
+            Client("client_1", "BrightSmile Dental", "Ava", "ava@example.com", "am@example.com", "monthly", date(2026, 6, 8)),
+            [MetricRow("client_1", "BrightSmile Dental", "Feb-2026", 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)],
+            [],
+        )
+
+        self.assertEqual(output.html_report, "<h1>Report</h1>")
+        self.assertEqual(len(calls), 3)
+        self.assertIn("FINAL REPAIR ATTEMPT", calls[2]["messages"][-1]["content"])
+        self.assertIn("executive_summary", calls[2]["messages"][-1]["content"])
+
+    def test_generate_report_blocks_after_final_repair_attempt_fails(self):
+        calls = []
+
+        def post(url, payload, headers):
+            calls.append(payload)
+            return {"choices": [{"message": {"content": "{}"}}]}
+
+        client = OpenRouterClient(api_key="fake", http_post=post)
+
+        with self.assertRaises(StructuredOutputError) as context:
+            client.generate_report(
+                Client("client_1", "BrightSmile Dental", "Ava", "ava@example.com", "am@example.com", "monthly", date(2026, 6, 8)),
+                [MetricRow("client_1", "BrightSmile Dental", "Feb-2026", 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)],
+                [],
+            )
+
+        self.assertEqual(len(calls), 3)
+        self.assertIn("final repair attempt failed", str(context.exception))
+        self.assertIn("first attempt also failed", str(context.exception))
+
     def test_question_answer_payload_uses_grounded_client_qna_prompt(self):
         payload = OpenRouterClient(api_key="fake")._question_answer_payload(
             Client("client_1", "BrightSmile Dental", "Ava", "ava@example.com", "am@example.com", "monthly", date(2026, 6, 8)),
