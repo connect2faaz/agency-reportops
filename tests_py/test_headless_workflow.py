@@ -45,6 +45,17 @@ class HighRiskQuestionAI:
         )
 
 
+class HighRiskDefinitionQuestionAI(HighRiskQuestionAI):
+    def draft_question_answer(self, client, question, report_html):
+        return QuestionAnswerOutput(
+            intent="question",
+            risk_level="high",
+            risk_reason="The model treated this definition question as unclear.",
+            answer_html="<p>This needs account-manager review before sending.</p>",
+            requires_am_review=True,
+        )
+
+
 class FailingReportAI:
     def generate_report(self, client, metrics, review_notes):
         raise AssertionError("AI should not be called without metrics")
@@ -850,6 +861,96 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertIn("display:none", store.gmail.sent_messages[0]["body"])
         self.assertEqual(store.processed_message_ids, ["gmail_1"])
 
+    def test_am_great_reply_approves_report(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.AM_REVIEW,
+                    html_report="<h1>Report</h1>",
+                    gmail_thread_id="thread_1",
+                )
+            ],
+        )
+        store.gmail.inbound_messages = [
+            GmailInboundMessage(
+                message_id="gmail_great",
+                thread_id="thread_1",
+                subject="Re: report ready",
+                from_email="am@example.com",
+                headers={"references": "<reportops-run_1@local.reportops>"},
+                body="Great",
+                snippet="Great",
+                received_at=datetime.now(timezone.utc),
+            )
+        ]
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_report(), gmail=store.gmail)
+
+        workflow.sync_replies()
+
+        self.assertEqual(store.runs[0].status, RunStatus.CLIENT_DELIVERED)
+        self.assertEqual(store.gmail.sent_messages[0]["to"], "ava@example.com")
+        self.assertEqual(store.processed_message_ids, ["gmail_great"])
+
+    def test_unclear_am_report_reply_gets_clarification_email(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.AM_REVIEW,
+                    html_report="<h1>Report</h1>",
+                    gmail_thread_id="thread_1",
+                )
+            ],
+        )
+        store.gmail.inbound_messages = [
+            GmailInboundMessage(
+                message_id="gmail_unclear",
+                thread_id="thread_1",
+                subject="Re: report ready",
+                from_email="am@example.com",
+                headers={"references": "<reportops-run_1@local.reportops>"},
+                body="Looks interesting",
+                snippet="Looks interesting",
+                received_at=datetime.now(timezone.utc),
+            )
+        ]
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_report(), gmail=store.gmail)
+
+        workflow.sync_replies()
+
+        self.assertEqual(store.runs[0].status, RunStatus.AM_REVIEW)
+        self.assertEqual(store.gmail.sent_messages[0]["to"], "am@example.com")
+        self.assertEqual(store.gmail.sent_messages[0]["thread_id"], "thread_1")
+        self.assertIn("Please reply Approved to send", store.gmail.sent_messages[0]["body"])
+        self.assertEqual(store.processed_message_ids, ["gmail_unclear"])
+
     def test_reprocessed_am_approval_does_not_resend_existing_current_delivery(self):
         review_sent_at = datetime(2026, 6, 8, 10, 0, tzinfo=timezone.utc)
         store = InMemorySheetStore(
@@ -1161,7 +1262,10 @@ class HeadlessWorkflowTests(unittest.TestCase):
                 thread_id="client_thread",
                 subject="Re: performance report",
                 from_email="ava@example.com",
-                headers={"references": "<reportops-client-run_1@local.reportops>"},
+                headers={
+                    "message-id": "<client-question-low@example.com>",
+                    "references": "<reportops-client-run_1@local.reportops>",
+                },
                 body="Which channel had the best ROAS?",
                 snippet="",
                 received_at=datetime.now(timezone.utc),
@@ -1188,8 +1292,9 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertEqual(store.gmail.sent_messages[0]["to"], "ava@example.com")
         self.assertEqual(store.gmail.sent_messages[0]["thread_id"], "client_thread")
         self.assertEqual(store.gmail.sent_messages[0]["subject"], "Re: BrightSmile Dental Feb-2026 performance report")
-        self.assertIn("In-Reply-To: <reportops-client-run_1@local.reportops>", store.gmail.sent_messages[0]["raw"])
-        self.assertIn("References: <reportops-client-run_1@local.reportops>", store.gmail.sent_messages[0]["raw"])
+        self.assertEqual(store.questions[0].client_reply_message_id, "<client-question-low@example.com>")
+        self.assertIn("In-Reply-To: <client-question-low@example.com>", store.gmail.sent_messages[0]["raw"])
+        self.assertIn("References: <client-question-low@example.com>", store.gmail.sent_messages[0]["raw"])
         self.assertEqual(store.gmail.sent_messages[1]["to"], "am@example.com")
 
     def test_client_question_auto_reply_is_recorded_and_not_processed_again(self):
@@ -1300,6 +1405,52 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertEqual(store.runs[0].status, RunStatus.REPLY_REVIEW)
         self.assertEqual(store.gmail.sent_messages[0]["to"], "am@example.com")
 
+    def test_simple_roas_definition_question_auto_replies_even_if_ai_marks_high_risk(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.CLIENT_DELIVERED,
+                    html_report="<h1>Report</h1>",
+                    client_thread_id="client_thread",
+                )
+            ],
+        )
+        store.gmail.inbound_messages = [
+            GmailInboundMessage(
+                message_id="gmail_roas_definition",
+                thread_id="client_thread",
+                subject="Re: performance report",
+                from_email="ava@example.com",
+                headers={"references": "<reportops-client-run_1@local.reportops>"},
+                body="What does ROAS mean?",
+                snippet="",
+                received_at=datetime.now(timezone.utc),
+            )
+        ]
+        workflow = ReportingWorkflow(store=store, ai=HighRiskDefinitionQuestionAI(), gmail=store.gmail)
+
+        workflow.sync_replies()
+
+        self.assertEqual(store.questions[0].risk_level, "low")
+        self.assertEqual(store.questions[0].status, "auto_replied")
+        self.assertIn("return on ad spend", store.questions[0].answer_html.lower())
+        self.assertEqual(store.runs[0].status, RunStatus.CLIENT_DELIVERED)
+        self.assertEqual(store.gmail.sent_messages[0]["to"], "ava@example.com")
+
     def test_am_approved_client_question_answer_replies_in_original_client_thread(self):
         store = InMemorySheetStore(
             clients=[
@@ -1334,6 +1485,7 @@ class HeadlessWorkflowTests(unittest.TestCase):
                 risk_level="high",
                 answer_html="<p>ROAS means return on ad spend.</p>",
                 status="needs_review",
+                client_reply_message_id="<client-question-high@example.com>",
             )
         ]
         store.gmail.inbound_messages = [
@@ -1357,8 +1509,63 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertEqual(store.gmail.sent_messages[0]["to"], "ava@example.com")
         self.assertEqual(store.gmail.sent_messages[0]["thread_id"], "client_thread")
         self.assertEqual(store.gmail.sent_messages[0]["subject"], "Re: BrightSmile Dental Feb-2026 performance report")
-        self.assertIn("In-Reply-To: <reportops-client-run_1@local.reportops>", store.gmail.sent_messages[0]["raw"])
-        self.assertIn("References: <reportops-client-run_1@local.reportops>", store.gmail.sent_messages[0]["raw"])
+        self.assertIn("In-Reply-To: <client-question-high@example.com>", store.gmail.sent_messages[0]["raw"])
+        self.assertIn("References: <client-question-high@example.com>", store.gmail.sent_messages[0]["raw"])
+
+    def test_am_approved_client_question_answer_uses_question_gmail_thread(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.REPLY_REVIEW,
+                    html_report="<h1>Report</h1>",
+                    gmail_thread_id="am_thread",
+                    client_thread_id="older_client_thread",
+                )
+            ],
+        )
+        store.questions = [
+            Question(
+                question_id="question_1",
+                run_id="run_1",
+                client_id="client_1",
+                question="Can you explain ROAS?",
+                risk_level="high",
+                answer_html="<p>ROAS means return on ad spend.</p>",
+                status="needs_review",
+                gmail_thread_id="actual_question_thread",
+            )
+        ]
+        store.gmail.inbound_messages = [
+            GmailInboundMessage(
+                message_id="gmail_am_approval",
+                thread_id="am_thread",
+                subject="Re: AM review needed for client reply",
+                from_email="am@example.com",
+                headers={"references": "<reportops-run_1@local.reportops>"},
+                body="Approved",
+                snippet="Approved",
+                received_at=datetime.now(timezone.utc),
+            )
+        ]
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_report(), gmail=store.gmail)
+
+        workflow.sync_replies()
+
+        self.assertEqual(store.gmail.sent_messages[0]["thread_id"], "actual_question_thread")
 
     def test_client_question_answer_references_stored_client_delivery_message_id(self):
         store = InMemorySheetStore(
@@ -1415,6 +1622,7 @@ class HeadlessWorkflowTests(unittest.TestCase):
 
     def test_reply_classifiers_are_conservative(self):
         self.assertEqual(classify_am_reply("Approved, send it"), "approve")
+        self.assertEqual(classify_am_reply("Great"), "approve")
         self.assertEqual(classify_am_reply("Please change the budget section"), "request_changes")
         self.assertEqual(classify_am_reply("Looks interesting"), "unclear")
         self.assertEqual(classify_client_question_risk("Which channel performed best?"), "low")

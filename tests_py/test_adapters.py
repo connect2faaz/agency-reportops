@@ -7,7 +7,7 @@ from unittest.mock import patch
 from reportops.ai import OpenRouterClient, StructuredOutputError
 from reportops.gmail_api import GmailApiClient
 from reportops.google_auth import refresh_google_access_token
-from reportops.models import Client, MessageRecord, MetricRow, Run, RunStatus
+from reportops.models import Client, MessageRecord, MetricRow, Question, Run, RunStatus
 from reportops.pubsub import GmailPubSubAuthError, decode_gmail_pubsub_notification, handle_gmail_pubsub_push
 from reportops.sheets import GoogleSheetsStore, SheetClient
 
@@ -212,6 +212,35 @@ class GoogleSheetsStoreTests(unittest.TestCase):
         self.assertEqual(row["approved_at"], "2026-06-02T10:30:00+00:00")
         self.assertEqual(row["delivered_at"], "2026-06-02T11:00:00+00:00")
         self.assertEqual(row["last_am_review_sent_at"], "2026-06-01T10:05:00+00:00")
+
+    def test_preserves_question_timestamps_when_rewriting_sheet_rows(self):
+        fake = FakeSheetClient()
+        fake.tabs["Questions"] = [
+            {
+                "question_id": "question_1",
+                "run_id": "run_1",
+                "client_id": "client_1",
+                "question": "What does ROAS mean?",
+                "risk_level": "low",
+                "answer_html": "<p>ROAS means return on ad spend.</p>",
+                "status": "auto_replied",
+                "gmail_thread_id": "client_thread",
+                "client_reply_message_id": "<client-question@example.com>",
+                "created_at": "2026-06-02T12:00:00+00:00",
+                "sent_at": "2026-06-02T12:01:00+00:00",
+            }
+        ]
+        store = GoogleSheetsStore(fake)
+
+        self.assertEqual(store.questions[0].created_at, datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(store.questions[0].sent_at, datetime(2026, 6, 2, 12, 1, tzinfo=timezone.utc))
+
+        store.flush()
+
+        row = fake.tabs["Questions"][0]
+        self.assertEqual(row["client_reply_message_id"], "<client-question@example.com>")
+        self.assertEqual(row["created_at"], "2026-06-02T12:00:00+00:00")
+        self.assertEqual(row["sent_at"], "2026-06-02T12:01:00+00:00")
 
 
 class GmailApiClientTests(unittest.TestCase):

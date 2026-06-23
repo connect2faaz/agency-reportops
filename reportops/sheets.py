@@ -151,6 +151,8 @@ def _headers_for_tab(tab_name: str) -> list[str]:
             "risk_level",
             "answer_html",
             "status",
+            "gmail_thread_id",
+            "client_reply_message_id",
             "created_at",
             "sent_at",
         ],
@@ -247,4 +249,8 @@ def _question_from_row(row: dict[str, str]) -> Question:
         risk_level=row.get("risk_level", ""),
         answer_html=row.get("answer_html", ""),
         status=row.get("status", ""),
+        gmail_thread_id=row.get("gmail_thread_id", ""),
+        client_reply_message_id=row.get("client_reply_message_id", ""),
+        created_at=parse_datetime(row.get("created_at")) or utc_now(),
+        sent_at=parse_datetime(row.get("sent_at")),
     )

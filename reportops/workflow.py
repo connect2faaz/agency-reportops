@@ -14,6 +14,7 @@ from .gmail import (
     extract_newest_reply_text,
     extract_run_id_from_reply,
     is_reply,
+    simple_metric_definition_answer,
 )
 from .models import Client, MessageRecord, MetricRow, Question, Run, RunStatus, parse_month_period, utc_now
 
@@ -332,7 +333,38 @@ class ReportingWorkflow:
             self._start_or_retry_report(client, run.period, force=True)
             return
         run.last_error = f"Unclear AM reply: {reply_text}"
+        self._send_am_clarification_request(client, run)
         self.store.record_processed(inbound.message_id)
+
+    def _send_am_clarification_request(self, client: Client, run: Run) -> None:
+        body = (
+            "<p>I could not tell whether your reply approved the report or requested changes.</p>"
+            "<p>Please reply Approved to send, or reply with the specific changes needed.</p>"
+            f"{self._hidden_reference(f'run:{run.run_id}')}"
+        )
+        sent = self.gmail.send_html(
+            to=client.account_manager_email,
+            subject=f"Re: {client.client_name} report ready for review",
+            html_body=body,
+            headers={
+                "X-ReportOps-Run-Id": run.run_id,
+                "X-ReportOps-Message-Type": "account_manager_clarification",
+            },
+            thread_id=run.gmail_thread_id,
+        )
+        run.updated_at = utc_now()
+        self.store.save_message(
+            MessageRecord(
+                message_id=new_id("message"),
+                run_id=run.run_id,
+                message_type="account_manager_clarification",
+                to=client.account_manager_email,
+                subject=f"Re: {client.client_name} report ready for review",
+                gmail_message_id=sent["id"],
+                gmail_thread_id=sent["thread_id"],
+                status="sent",
+            )
+        )
 
     def _send_client_report(self, client: Client, run: Run) -> None:
         body = f"{run.html_report}<hr>{self._hidden_reference(f'client:{run.run_id}')}"
@@ -386,17 +418,25 @@ class ReportingWorkflow:
         client.next_report_date = next_report_date
 
     def _handle_client_reply(self, run: Run, client: Client, inbound: GmailInboundMessage, reply_text: str) -> None:
+        if inbound.thread_id:
+            run.client_thread_id = inbound.thread_id
+        client_reply_message_id = self._header_message_id(inbound)
         regex_risk = classify_client_question_risk(reply_text)
-        try:
-            draft = self.ai.draft_question_answer(client, reply_text, run.html_report)
-            risk = "high" if regex_risk == "high" or draft.requires_am_review or draft.risk_level != "low" else "low"
-            answer = draft.answer_html
-        except StructuredOutputError as error:
-            risk = "high"
-            answer = (
-                "<p>This client question needs account-manager review before a response is sent.</p>"
-                f"<p><strong>AI draft error:</strong> {error}</p>"
-            )
+        definition_answer = simple_metric_definition_answer(reply_text) if regex_risk == "low" else None
+        if definition_answer is not None:
+            risk = "low"
+            answer = definition_answer
+        else:
+            try:
+                draft = self.ai.draft_question_answer(client, reply_text, run.html_report)
+                risk = "high" if regex_risk == "high" or draft.requires_am_review or draft.risk_level != "low" else "low"
+                answer = draft.answer_html
+            except StructuredOutputError as error:
+                risk = "high"
+                answer = (
+                    "<p>This client question needs account-manager review before a response is sent.</p>"
+                    f"<p><strong>AI draft error:</strong> {error}</p>"
+                )
         question = Question(
             question_id=new_id("question"),
             run_id=run.run_id,
@@ -405,12 +445,20 @@ class ReportingWorkflow:
             risk_level=risk,
             answer_html=answer,
             status="open",
+            gmail_thread_id=inbound.thread_id,
+            client_reply_message_id=client_reply_message_id,
         )
         self.store.questions.append(question)
         if risk == "low":
             question.status = "auto_replied"
             question.sent_at = utc_now()
-            self._send_client_question_answer(client, run, answer)
+            self._send_client_question_answer(
+                client,
+                run,
+                answer,
+                thread_id=question.gmail_thread_id,
+                reply_to_message_id=question.client_reply_message_id,
+            )
         else:
             question.status = "needs_review"
             run.status = RunStatus.REPLY_REVIEW
@@ -436,25 +484,40 @@ class ReportingWorkflow:
                 client = self.store.client_by_id(run.client_id)
                 question.status = "sent"
                 question.sent_at = utc_now()
-                self._send_client_question_answer(client, run, question.answer_html)
+                self._send_client_question_answer(
+                    client,
+                    run,
+                    question.answer_html,
+                    thread_id=question.gmail_thread_id,
+                    reply_to_message_id=question.client_reply_message_id,
+                )
                 run.status = RunStatus.CLIENT_DELIVERED
                 break
         self.store.record_processed(inbound.message_id)
 
-    def _send_client_question_answer(self, client: Client, run: Run, answer_html: str) -> None:
+    def _send_client_question_answer(
+        self,
+        client: Client,
+        run: Run,
+        answer_html: str,
+        thread_id: str | None = None,
+        reply_to_message_id: str | None = None,
+    ) -> None:
         subject = self._client_report_reply_subject(client, run)
+        resolved_thread_id = thread_id or run.client_thread_id
+        resolved_reply_to = reply_to_message_id or run.client_message_id or self._client_report_message_id(run)
         sent = self.gmail.send_html(
             to=client.contact_email,
             subject=subject,
             html_body=f"{answer_html}{self._hidden_reference(f'client:{run.run_id}')}",
             headers={
-                "In-Reply-To": run.client_message_id or self._client_report_message_id(run),
-                "References": run.client_message_id or self._client_report_message_id(run),
+                "In-Reply-To": resolved_reply_to,
+                "References": resolved_reply_to,
                 "X-ReportOps-Run-Id": run.run_id,
                 "X-ReportOps-Client-Id": client.client_id,
                 "X-ReportOps-Message-Type": "question_answer",
             },
-            thread_id=run.client_thread_id,
+            thread_id=resolved_thread_id,
         )
         self.store.save_message(
             MessageRecord(
@@ -497,6 +560,14 @@ class ReportingWorkflow:
     def _new_message_id(self, message_type: str, run: Run) -> str:
         domain = self._message_id_domain()
         return f"<reportops-{message_type}-{run.run_id}-{secrets.token_hex(8)}@{domain}>"
+
+    @staticmethod
+    def _header_message_id(message: GmailInboundMessage) -> str:
+        return (
+            message.headers.get("message-id", "")
+            or message.headers.get("Message-ID", "")
+            or message.headers.get("Message-Id", "")
+        ).strip()
 
     def _message_id_domain(self) -> str:
         sender = str(getattr(self.gmail, "sender_email", "") or "")

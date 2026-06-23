@@ -173,6 +173,8 @@ class Question:
     risk_level: str
     answer_html: str
     status: str
+    gmail_thread_id: str = ""
+    client_reply_message_id: str = ""
     created_at: datetime = field(default_factory=utc_now)
     sent_at: datetime | None = None
 

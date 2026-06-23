@@ -83,10 +83,13 @@ def build_raw_email_base64url(sender: str, to: str, subject: str, html_body: str
 
 def classify_am_reply(text: str) -> str:
     value = text.lower()
-    if re.search(r"\b(approve|approved|looks good|send it|ship it|go ahead)\b", value):
-        return "approve"
-    if re.search(r"\b(change|revise|edit|update|fix|remove|disapprove|not approved)\b", value):
+    if re.search(r"\b(change|revise|edit|update|fix|remove|disapprove|not approved|not great|not good)\b", value):
         return "request_changes"
+    if re.search(
+        r"\b(approve|approved|looks good|good to go|all good|great|send it|ship it|go ahead|ok to send|okay to send)\b",
+        value,
+    ):
+        return "approve"
     return "unclear"
 
 
@@ -99,6 +102,24 @@ def classify_client_question_risk(text: str) -> str:
         r"|\b(you said|we expected|as promised|was supposed to|should have been)\b"
     )
     return "high" if re.search(high_risk, value) else "low"
+
+
+def simple_metric_definition_answer(text: str) -> str | None:
+    value = text.lower()
+    if not re.search(r"\b(what|define|definition|mean|means|stand for|stands for)\b", value):
+        return None
+    definitions = {
+        "roas": ("ROAS", "return on ad spend", "revenue generated for each dollar spent on ads"),
+        "ctr": ("CTR", "click-through rate", "the share of impressions that became clicks"),
+        "cpl": ("CPL", "cost per lead", "ad spend divided by leads generated"),
+        "cpa": ("CPA", "cost per acquisition", "ad spend divided by acquisitions or conversions"),
+        "cpc": ("CPC", "cost per click", "ad spend divided by clicks"),
+        "cpm": ("CPM", "cost per thousand impressions", "ad spend per 1,000 impressions"),
+    }
+    for key, (label, expansion, explanation) in definitions.items():
+        if re.search(rf"\b{re.escape(key)}\b", value):
+            return f"<p><strong>{label}</strong> means {html.escape(expansion)}. It measures {html.escape(explanation)}.</p>"
+    return None
 
 
 def is_reply(message: GmailInboundMessage) -> bool:
