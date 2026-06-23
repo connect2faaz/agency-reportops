@@ -37,6 +37,14 @@ def _noop_decorator(func=None, *_args, **_kwargs):
     return decorate
 
 
+def _deploy_schedule(schedule_name: str) -> bool:
+    if os.getenv("REPORTOPS_DEPLOY_SCHEDULES", "1") == "0":
+        return False
+    if schedule_name == "poll_gmail_replies":
+        return os.getenv("REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE", "").strip() == "1"
+    return True
+
+
 if modal is not None:
     app = modal.App("reportops-headless")
     image = modal.Image.debian_slim().pip_install("fastapi[standard]").add_local_python_source("reportops")
@@ -45,14 +53,18 @@ if modal is not None:
     def modal_function(**kwargs):
         return app.function(image=image, secrets=[secret], **kwargs)
 
-    if os.getenv("REPORTOPS_DEPLOY_SCHEDULES", "1") == "0":
-        poll_schedule = modal_function()
-        daily_schedule = modal_function()
-        watch_schedule = modal_function()
-    else:
+    if _deploy_schedule("poll_gmail_replies"):
         poll_schedule = modal_function(schedule=modal.Cron(SCHEDULE_PLAN["poll_gmail_replies"]))
+    else:
+        poll_schedule = modal_function()
+    if _deploy_schedule("run_daily_reports"):
         daily_schedule = modal_function(schedule=modal.Cron(SCHEDULE_PLAN["run_daily_reports"]))
+    else:
+        daily_schedule = modal_function()
+    if _deploy_schedule("renew_gmail_watch"):
         watch_schedule = modal_function(schedule=modal.Cron(SCHEDULE_PLAN["renew_gmail_watch"]))
+    else:
+        watch_schedule = modal_function()
     pubsub_endpoint = modal.fastapi_endpoint(method="POST")
 else:
     app = None

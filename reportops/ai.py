@@ -5,7 +5,7 @@ import os
 from dataclasses import asdict
 from json import JSONDecodeError
 from typing import Any, Callable
-from urllib import request
+from urllib import error, request
 
 from .models import Client, MetricRow, QuestionAnswerOutput, ReportOutput
 
@@ -93,7 +93,7 @@ class OpenRouterClient:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "openai/gpt-oss-120b:free",
+        model: str = "openai/gpt-4o-mini",
         base_url: str | None = None,
         http_post: Callable[[str, dict[str, Any], dict[str, str]], dict[str, Any]] | None = None,
     ) -> None:
@@ -223,6 +223,8 @@ class OpenRouterClient:
                     },
                 },
             },
+            "provider": {"require_parameters": True},
+            "plugins": [{"id": "response-healing"}],
         }
         return payload
 
@@ -315,6 +317,8 @@ class OpenRouterClient:
                     },
                 },
             },
+            "provider": {"require_parameters": True},
+            "plugins": [{"id": "response-healing"}],
         }
 
     @staticmethod
@@ -394,5 +398,14 @@ class OpenRouterClient:
     @staticmethod
     def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
         req = request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-        with request.urlopen(req, timeout=60) as response:
-            return json.loads(response.read().decode("utf-8"))
+        try:
+            with request.urlopen(req, timeout=60) as response:
+                body = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            raise StructuredOutputError(f"OpenRouter HTTP request failed with status {exc.code}.") from None
+        except error.URLError as exc:
+            raise StructuredOutputError(f"OpenRouter HTTP request failed: {exc.reason}") from None
+        try:
+            return json.loads(body)
+        except JSONDecodeError as exc:
+            raise StructuredOutputError(f"OpenRouter returned non-JSON response: {exc}") from None

@@ -5,6 +5,7 @@ from unittest.mock import patch
 import modal_app
 from reportops.ai import OpenRouterClient
 from reportops.models import Client, MetricRow, Run, RunStatus
+from reportops.pubsub import GmailPubSubNotification
 from reportops.workflow import InMemorySheetStore, ReportingWorkflow
 
 
@@ -28,6 +29,29 @@ class ModalEntrypointTests(unittest.TestCase):
             },
         )
         self.assertFalse(hasattr(modal_app, "scheduled_tick"))
+
+    def test_gmail_reply_poller_schedule_is_not_deployed_by_default(self):
+        with patch.dict(modal_app.os.environ, {}, clear=True):
+            self.assertFalse(modal_app._deploy_schedule("poll_gmail_replies"))
+            self.assertTrue(modal_app._deploy_schedule("run_daily_reports"))
+            self.assertTrue(modal_app._deploy_schedule("renew_gmail_watch"))
+
+    def test_gmail_reply_poller_schedule_can_be_deployed_by_env(self):
+        with patch.dict(modal_app.os.environ, {"REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE": "1"}, clear=True):
+            self.assertTrue(modal_app._deploy_schedule("poll_gmail_replies"))
+
+    def test_global_schedule_disable_still_disables_all_schedules(self):
+        with patch.dict(
+            modal_app.os.environ,
+            {
+                "REPORTOPS_DEPLOY_SCHEDULES": "0",
+                "REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE": "1",
+            },
+            clear=True,
+        ):
+            self.assertFalse(modal_app._deploy_schedule("poll_gmail_replies"))
+            self.assertFalse(modal_app._deploy_schedule("run_daily_reports"))
+            self.assertFalse(modal_app._deploy_schedule("renew_gmail_watch"))
 
     def test_run_now_has_extended_modal_timeout_for_multi_client_generation(self):
         self.assertGreaterEqual(modal_app.FUNCTION_TIMEOUTS["run_now"], 3600)
@@ -93,6 +117,30 @@ class ModalEntrypointTests(unittest.TestCase):
         self.assertEqual(store.runs[0].last_error, "")
         self.assertEqual(len(store.gmail.sent_messages), 1)
 
+    def test_poll_gmail_replies_runs_existing_reply_sync_and_flushes_store(self):
+        class SyncCapturingWorkflow:
+            def __init__(self):
+                self.sync_count = 0
+
+            def sync_replies(self):
+                self.sync_count += 1
+
+        class FlushCapturingStore:
+            def __init__(self):
+                self.flush_count = 0
+
+            def flush(self):
+                self.flush_count += 1
+
+        workflow = SyncCapturingWorkflow()
+        store = FlushCapturingStore()
+
+        with patch.object(modal_app, "_build_workflow", return_value=(workflow, store)):
+            modal_app.poll_gmail_replies()
+
+        self.assertEqual(workflow.sync_count, 1)
+        self.assertEqual(store.flush_count, 1)
+
     def test_process_gmail_push_runs_existing_reply_sync_and_flushes_store(self):
         class SyncCapturingWorkflow:
             def __init__(self):
@@ -116,6 +164,30 @@ class ModalEntrypointTests(unittest.TestCase):
 
         self.assertEqual(workflow.sync_count, 1)
         self.assertEqual(store.flush_count, 1)
+
+    def test_gmail_push_processor_spawn_runs_by_default(self):
+        calls = []
+
+        def process_push(payload):
+            calls.append(payload)
+
+        notification = GmailPubSubNotification(email_address="sender@example.com", history_id="12345")
+
+        with patch.object(modal_app, "process_gmail_push", process_push):
+            modal_app._spawn_process_gmail_push(notification)
+
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "email_address": "sender@example.com",
+                    "history_id": "12345",
+                    "pubsub_message_id": "",
+                    "publish_time": "",
+                    "subscription": "",
+                }
+            ],
+        )
 
     def test_renew_gmail_watch_uses_configured_pubsub_topic(self):
         class WatchCapturingGmail:

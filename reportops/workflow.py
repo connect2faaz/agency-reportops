@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import secrets
 from calendar import monthrange
 from datetime import date, datetime, timedelta
@@ -131,12 +132,13 @@ class ReportingWorkflow:
         self.gmail = gmail
 
     def run_due_reports(self, today: date, period: str | None = None) -> None:
+        report_period = period or self._default_period(today)
         for client in select_due_clients(self.store.clients, today):
-            self._start_or_retry_report(client, period or self._default_period(today), force=False)
+            self._run_report_with_unexpected_failure_block(client, report_period, force=False)
 
     def run_client_report(self, client_id: str, today: date, period: str | None = None) -> None:
         client = self.store.client_by_id(client_id)
-        self._start_or_retry_report(client, period or self._default_period(today), force=True)
+        self._run_report_with_unexpected_failure_block(client, period or self._default_period(today), force=True)
 
     def sync_replies(self) -> None:
         outbound_message_ids = {
@@ -162,6 +164,17 @@ class ReportingWorkflow:
             elif run.status == RunStatus.REPLY_REVIEW:
                 self._handle_am_question_reply(run, inbound, reply_text)
 
+    def _run_report_with_unexpected_failure_block(self, client: Client, period: str, force: bool) -> None:
+        try:
+            self._start_or_retry_report(client, period, force=force)
+        except Exception as error:
+            run = self.store.run_for_report_period(client.client_id, period)
+            if run is None:
+                run = Run(run_id=new_id("run"), client_id=client.client_id, period=period, status=RunStatus.BLOCKED)
+                run.attempt_count = 1
+                self.store.runs.append(run)
+            self._block_run(client, run, f"Unexpected report run failure: {type(error).__name__}: {error}")
+
     def _start_or_retry_report(self, client: Client, period: str, force: bool = False) -> None:
         run = self.store.run_for_report_period(client.client_id, period)
         if run is not None and not force:
@@ -175,19 +188,61 @@ class ReportingWorkflow:
         run.updated_at = utc_now()
         metrics = self.store.metrics_for_report_period(client.client_id, period)
         if not metrics:
-            run.status = RunStatus.BLOCKED
-            run.last_error = f"No metrics found for client_id={client.client_id} period={period}."
+            self._block_run(client, run, f"No metrics found for client_id={client.client_id} period={period}.")
             return
         try:
             report = self.ai.generate_report(client, metrics, run.am_review_notes)
         except StructuredOutputError as error:
-            run.status = RunStatus.BLOCKED
-            run.last_error = str(error)
+            self._block_run(client, run, str(error))
             return
         run.status = RunStatus.AM_REVIEW
         run.last_error = ""
         run.html_report = report.html_report
         self._send_am_review(client, run)
+
+    def _block_run(self, client: Client, run: Run, error_message: str) -> None:
+        run.status = RunStatus.BLOCKED
+        run.last_error = error_message
+        run.updated_at = utc_now()
+        self._send_support_error(client, run, error_message)
+
+    def _send_support_error(self, client: Client, run: Run, error_message: str) -> None:
+        support_email = client.support_email.strip()
+        if not support_email:
+            return
+        body = (
+            "<p><strong>Agency's ReportOps blocked a report before AM review.</strong></p>"
+            f"<p><strong>Client:</strong> {html.escape(client.client_name)} ({html.escape(client.client_id)})</p>"
+            f"<p><strong>Period:</strong> {html.escape(run.period)}</p>"
+            f"<p><strong>Run ID:</strong> {html.escape(run.run_id)}</p>"
+            f"<p><strong>Attempt:</strong> {run.attempt_count}</p>"
+            f"<p><strong>Error:</strong> {html.escape(error_message)}</p>"
+        )
+        try:
+            sent = self.gmail.send_html(
+                to=support_email,
+                subject=f"ReportOps blocked: {client.client_name} {run.period}",
+                html_body=body,
+                headers={
+                    "X-ReportOps-Run-Id": run.run_id,
+                    "X-ReportOps-Message-Type": "support_error",
+                },
+            )
+        except Exception as error:
+            run.last_error = f"{error_message}; support notification failed: {type(error).__name__}: {error}"
+            return
+        self.store.save_message(
+            MessageRecord(
+                message_id=new_id("message"),
+                run_id=run.run_id,
+                message_type="support_error",
+                to=support_email,
+                subject=f"ReportOps blocked: {client.client_name} {run.period}",
+                gmail_message_id=sent["id"],
+                gmail_thread_id=sent["thread_id"],
+                status="sent",
+            )
+        )
 
     def _send_am_review(self, client: Client, run: Run) -> None:
         body = (
@@ -266,7 +321,8 @@ class ReportingWorkflow:
         if intent == "approve":
             run.status = RunStatus.CLIENT_DELIVERED
             run.approved_at = utc_now()
-            self._send_client_report(client, run)
+            if not self._client_delivery_sent_for_current_review(run):
+                self._send_client_report(client, run)
             self.store.record_processed(inbound.message_id)
             self.gmail.mark_read(inbound.message_id)
             return
@@ -280,18 +336,20 @@ class ReportingWorkflow:
 
     def _send_client_report(self, client: Client, run: Run) -> None:
         body = f"{run.html_report}<hr>{self._hidden_reference(f'client:{run.run_id}')}"
+        message_id = self._new_message_id("client", run)
         sent = self.gmail.send_html(
             to=client.contact_email,
             subject=self._client_report_subject(client, run),
             html_body=body,
             headers={
-                "Message-ID": self._client_report_message_id(run),
+                "Message-ID": message_id,
                 "X-ReportOps-Run-Id": run.run_id,
                 "X-ReportOps-Client-Id": client.client_id,
                 "X-ReportOps-Message-Type": "client_delivery",
             },
         )
         run.client_thread_id = sent["thread_id"]
+        run.client_message_id = message_id
         run.delivered_at = utc_now()
         self._mark_client_report_delivered(client, run.delivered_at.date())
         self.store.save_message(
@@ -306,6 +364,18 @@ class ReportingWorkflow:
                 status="sent",
             )
         )
+
+    def _client_delivery_sent_for_current_review(self, run: Run) -> bool:
+        review_sent_at = run.last_am_review_sent_at or run.created_at
+        for message in self.store.messages:
+            if (
+                message.run_id == run.run_id
+                and message.message_type == "client_delivery"
+                and message.status == "sent"
+                and message.created_at >= review_sent_at
+            ):
+                return True
+        return False
 
     @staticmethod
     def _mark_client_report_delivered(client: Client, delivered_date: date) -> None:
@@ -378,8 +448,8 @@ class ReportingWorkflow:
             subject=subject,
             html_body=f"{answer_html}{self._hidden_reference(f'client:{run.run_id}')}",
             headers={
-                "In-Reply-To": self._client_report_message_id(run),
-                "References": self._client_report_message_id(run),
+                "In-Reply-To": run.client_message_id or self._client_report_message_id(run),
+                "References": run.client_message_id or self._client_report_message_id(run),
                 "X-ReportOps-Run-Id": run.run_id,
                 "X-ReportOps-Client-Id": client.client_id,
                 "X-ReportOps-Message-Type": "question_answer",
@@ -423,6 +493,18 @@ class ReportingWorkflow:
     @staticmethod
     def _client_report_message_id(run: Run) -> str:
         return f"<reportops-client-{run.run_id}@local.reportops>"
+
+    def _new_message_id(self, message_type: str, run: Run) -> str:
+        domain = self._message_id_domain()
+        return f"<reportops-{message_type}-{run.run_id}-{secrets.token_hex(8)}@{domain}>"
+
+    def _message_id_domain(self) -> str:
+        sender = str(getattr(self.gmail, "sender_email", "") or "")
+        if "@" in sender:
+            domain = sender.rsplit("@", 1)[1].strip().lower()
+            if domain:
+                return domain
+        return "local.reportops"
 
     @staticmethod
     def _client_report_subject(client: Client, run: Run) -> str:

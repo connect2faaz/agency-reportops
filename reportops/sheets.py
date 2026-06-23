@@ -106,6 +106,7 @@ def _headers_for_tab(tab_name: str) -> list[str]:
             "contact_name",
             "contact_email",
             "account_manager_email",
+            "support_email",
             "cadence",
             "next_report_date",
             "status",
@@ -124,6 +125,7 @@ def _headers_for_tab(tab_name: str) -> list[str]:
             "html_report",
             "gmail_thread_id",
             "client_thread_id",
+            "client_message_id",
             "created_at",
             "updated_at",
             "approved_at",
@@ -213,6 +215,7 @@ def _run_from_row(row: dict[str, str]) -> Run:
         html_report=row.get("html_report", ""),
         gmail_thread_id=row.get("gmail_thread_id", ""),
         client_thread_id=row.get("client_thread_id", ""),
+        client_message_id=row.get("client_message_id", ""),
         created_at=parse_datetime(row.get("created_at")) or utc_now(),
         updated_at=parse_datetime(row.get("updated_at")) or utc_now(),
         approved_at=parse_datetime(row.get("approved_at")),
@@ -231,6 +234,7 @@ def _message_from_row(row: dict[str, str]) -> MessageRecord:
         gmail_message_id=row.get("gmail_message_id", ""),
         gmail_thread_id=row.get("gmail_thread_id", ""),
         status=row.get("status", ""),
+        created_at=parse_datetime(row.get("created_at")) or utc_now(),
     )
 
 

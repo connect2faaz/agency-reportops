@@ -76,6 +76,7 @@ class Client:
     run_now: bool = False
     paused: bool = False
     notes: str = ""
+    support_email: str = ""
 
     @classmethod
     def from_sheet_row(cls, row: dict[str, Any]) -> "Client":
@@ -91,6 +92,7 @@ class Client:
             run_now=parse_bool(row.get("run_now")),
             paused=parse_bool(row.get("paused")),
             notes=str(row.get("notes", "")).strip(),
+            support_email=str(row.get("support_email", "")).strip(),
         )
 
 
@@ -141,6 +143,7 @@ class Run:
     html_report: str = ""
     gmail_thread_id: str = ""
     client_thread_id: str = ""
+    client_message_id: str = ""
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
     approved_at: datetime | None = None

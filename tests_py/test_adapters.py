@@ -2,6 +2,7 @@ from datetime import date, datetime, timezone
 from io import BytesIO
 import unittest
 from urllib.error import HTTPError
+from unittest.mock import patch
 
 from reportops.ai import OpenRouterClient, StructuredOutputError
 from reportops.gmail_api import GmailApiClient
@@ -21,6 +22,7 @@ class FakeSheetClient(SheetClient):
                     "contact_name": "Ava",
                     "contact_email": "ava@example.com",
                     "account_manager_email": "am@example.com",
+                    "support_email": "support@example.com",
                     "cadence": "monthly",
                     "next_report_date": "2026-06-08",
                     "run_now": "",
@@ -99,6 +101,7 @@ class GoogleSheetsStoreTests(unittest.TestCase):
         store = GoogleSheetsStore(FakeSheetClient())
 
         self.assertEqual(store.clients[0].client_id, "client_1")
+        self.assertEqual(store.clients[0].support_email, "support@example.com")
         self.assertEqual(store.clients[0].next_report_date, date(2026, 6, 8))
         self.assertEqual(store.metrics[0].ad_spend, 3450)
 
@@ -142,6 +145,26 @@ class GoogleSheetsStoreTests(unittest.TestCase):
         self.assertEqual(fake.tabs["Runs"][0]["run_id"], "run_1")
         self.assertEqual(fake.tabs["Runs"][0]["status"], "am_review")
         self.assertEqual(fake.tabs["Messages"][0]["gmail_message_id"], "gmail_1")
+
+    def test_loads_message_created_at_from_sheet_rows(self):
+        fake = FakeSheetClient()
+        fake.tabs["Messages"] = [
+            {
+                "message_id": "message_1",
+                "run_id": "run_1",
+                "type": "client_delivery",
+                "to": "ava@example.com",
+                "subject": "BrightSmile Dental Feb-2026 performance report",
+                "gmail_message_id": "gmail_delivery",
+                "gmail_thread_id": "client_thread",
+                "status": "sent",
+                "created_at": "2026-06-01T10:05:00+00:00",
+            }
+        ]
+
+        store = GoogleSheetsStore(fake)
+
+        self.assertEqual(store.messages[0].created_at, datetime(2026, 6, 1, 10, 5, tzinfo=timezone.utc))
 
     def test_persists_run_last_am_review_sent_at(self):
         fake = FakeSheetClient()
@@ -388,6 +411,12 @@ class GmailPubSubTests(unittest.TestCase):
 
 
 class OpenRouterClientTests(unittest.TestCase):
+    def test_default_model_is_paid_openai_structured_output_model(self):
+        with patch.dict("os.environ", {}, clear=True):
+            client = OpenRouterClient(api_key="fake")
+
+        self.assertEqual(client.model, "openai/gpt-4o-mini")
+
     def test_report_payload_uses_ppc_account_manager_prompt(self):
         payload = OpenRouterClient(api_key="fake")._report_payload(
             Client("client_1", "BrightSmile Dental", "Ava", "ava@example.com", "am@example.com", "monthly", date(2026, 6, 8)),
@@ -403,6 +432,16 @@ class OpenRouterClientTests(unittest.TestCase):
         self.assertIn("html_report", system_prompt)
         self.assertIn("Use this exact HTML structure", system_prompt)
         self.assertIn("report-shell", system_prompt)
+
+    def test_report_payload_requires_structured_provider_and_response_healing(self):
+        payload = OpenRouterClient(api_key="fake")._report_payload(
+            Client("client_1", "BrightSmile Dental", "Ava", "ava@example.com", "am@example.com", "monthly", date(2026, 6, 8)),
+            [MetricRow("client_1", "BrightSmile Dental", "Feb-2026", 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)],
+            [],
+        )
+
+        self.assertEqual(payload["provider"], {"require_parameters": True})
+        self.assertEqual(payload["plugins"], [{"id": "response-healing"}])
 
     def test_report_payload_allows_empty_concerns_list(self):
         output = OpenRouterClient.parse_report_payload(
@@ -563,6 +602,27 @@ class OpenRouterClientTests(unittest.TestCase):
         self.assertIn("final repair attempt failed", str(context.exception))
         self.assertIn("first attempt also failed", str(context.exception))
 
+    def test_post_json_wraps_non_json_openrouter_response(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return b"<html>rate limit page</html>"
+
+        with patch("reportops.ai.request.urlopen", return_value=FakeResponse()):
+            with self.assertRaises(StructuredOutputError) as context:
+                OpenRouterClient._post_json(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    {"model": "test"},
+                    {"Authorization": "Bearer token"},
+                )
+
+        self.assertIn("OpenRouter returned non-JSON response", str(context.exception))
+
     def test_question_answer_payload_uses_grounded_client_qna_prompt(self):
         payload = OpenRouterClient(api_key="fake")._question_answer_payload(
             Client("client_1", "BrightSmile Dental", "Ava", "ava@example.com", "am@example.com", "monthly", date(2026, 6, 8)),
@@ -577,6 +637,8 @@ class OpenRouterClientTests(unittest.TestCase):
         self.assertEqual(payload["response_format"]["json_schema"]["name"], "question_answer_output")
         self.assertIn("complaints", system_prompt)
         self.assertIn("metric discrepancy", system_prompt)
+        self.assertEqual(payload["provider"], {"require_parameters": True})
+        self.assertEqual(payload["plugins"], [{"id": "response-healing"}])
 
     def test_question_answer_payload_parses_structured_low_risk_answer(self):
         output = OpenRouterClient.parse_question_answer_payload(

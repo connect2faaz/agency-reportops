@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+from email import message_from_string
 import unittest
 from unittest.mock import patch
 
@@ -62,6 +63,30 @@ class CountingReportAI:
 
     def draft_question_answer(self, client, question, report_html):
         return OpenRouterClient.fake_report().draft_question_answer(client, question, report_html)
+
+
+class NonJsonOpenRouterAI:
+    def __init__(self) -> None:
+        self.client = OpenRouterClient(api_key="fake", http_post=self._post)
+
+    def _post(self, url, payload, headers):
+        raise StructuredOutputError("OpenRouter returned non-JSON response: Expecting value")
+
+    def generate_report(self, client, metrics, review_notes):
+        return self.client.generate_report(client, metrics, review_notes)
+
+    def draft_question_answer(self, client, question, report_html):
+        raise AssertionError("Question drafting is not expected in this test")
+
+
+class OneClientCrashingAI:
+    def generate_report(self, client, metrics, review_notes):
+        if client.client_id == "client_a":
+            raise RuntimeError("temporary upstream failure")
+        return OpenRouterClient.fake_report().generate_report(client, metrics, review_notes)
+
+    def draft_question_answer(self, client, question, report_html):
+        raise AssertionError("Question drafting is not expected in this test")
 
 
 class HeadlessWorkflowTests(unittest.TestCase):
@@ -153,6 +178,27 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertEqual(store.messages[0].message_type, "account_manager_review")
         self.assertIn("Reference: run:", store.gmail.sent_messages[0]["body"])
         self.assertIn("display:none", store.gmail.sent_messages[0]["body"])
+
+    def test_due_reports_block_failed_client_and_continue_to_next_client(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client("client_a", "Client A", "Ava", "a@example.com", "am_a@example.com", "monthly", date(2026, 6, 8)),
+                Client("client_b", "Client B", "Bea", "b@example.com", "am_b@example.com", "monthly", date(2026, 6, 8)),
+            ],
+            metrics=[
+                MetricRow("client_a", "Client A", "Feb-2026", 100, 1000, 100, 10, 5, 20, 2, 2, 500, 5),
+                MetricRow("client_b", "Client B", "Feb-2026", 100, 1000, 100, 10, 5, 20, 2, 2, 500, 5),
+            ],
+        )
+        workflow = ReportingWorkflow(store=store, ai=OneClientCrashingAI(), gmail=store.gmail)
+
+        workflow.run_due_reports(today=date(2026, 6, 8), period="Feb-2026")
+
+        runs_by_client = {run.client_id: run for run in store.runs}
+        self.assertEqual(runs_by_client["client_a"].status, RunStatus.BLOCKED)
+        self.assertIn("temporary upstream failure", runs_by_client["client_a"].last_error)
+        self.assertEqual(runs_by_client["client_b"].status, RunStatus.AM_REVIEW)
+        self.assertEqual([message["to"] for message in store.gmail.sent_messages], ["am_b@example.com"])
 
     def test_scheduled_due_run_does_not_regenerate_existing_same_period_am_review(self):
         store = InMemorySheetStore(
@@ -539,6 +585,87 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertIn("structured output", store.runs[0].last_error)
         self.assertEqual(store.gmail.sent_messages, [])
 
+    def test_ai_failure_sends_internal_error_to_support_email(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                    support_email="support@example.com",
+                )
+            ],
+            metrics=[
+                MetricRow(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    month="Feb-2026",
+                    ad_spend=3450,
+                    impressions=131000,
+                    clicks=3290,
+                    ctr=2.51,
+                    leads=91,
+                    cpl=37.91,
+                    conversions=31,
+                    conversion_rate=0.94,
+                    revenue=20100,
+                    roas=5.83,
+                )
+            ],
+        )
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_failure(), gmail=store.gmail)
+
+        workflow.run_due_reports(today=date(2026, 6, 8), period="Feb-2026")
+
+        self.assertEqual(store.runs[0].status, RunStatus.BLOCKED)
+        self.assertEqual(store.gmail.sent_messages[0]["to"], "support@example.com")
+        self.assertIn("ReportOps blocked", store.gmail.sent_messages[0]["subject"])
+        self.assertIn("BrightSmile Dental", store.gmail.sent_messages[0]["body"])
+        self.assertEqual(store.messages[0].message_type, "support_error")
+
+    def test_non_json_openrouter_response_blocks_run_without_crashing(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            metrics=[
+                MetricRow(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    month="Feb-2026",
+                    ad_spend=100,
+                    impressions=1000,
+                    clicks=50,
+                    ctr=5,
+                    leads=5,
+                    cpl=20,
+                    conversions=2,
+                    conversion_rate=4,
+                    revenue=500,
+                    roas=5,
+                )
+            ],
+        )
+        workflow = ReportingWorkflow(store=store, ai=NonJsonOpenRouterAI(), gmail=store.gmail)
+
+        workflow.run_client_report("client_1", today=date(2026, 6, 8), period="Feb-2026")
+
+        self.assertEqual(store.runs[0].status, RunStatus.BLOCKED)
+        self.assertIn("OpenRouter returned non-JSON response", store.runs[0].last_error)
+        self.assertEqual(store.gmail.sent_messages, [])
+
     def test_reply_matching_prefers_headers_then_thread_then_body_marker(self):
         runs = [
             Run(
@@ -722,6 +849,96 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertIn("Reference: client:run_1", store.gmail.sent_messages[0]["body"])
         self.assertIn("display:none", store.gmail.sent_messages[0]["body"])
         self.assertEqual(store.processed_message_ids, ["gmail_1"])
+
+    def test_reprocessed_am_approval_does_not_resend_existing_current_delivery(self):
+        review_sent_at = datetime(2026, 6, 8, 10, 0, tzinfo=timezone.utc)
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.AM_REVIEW,
+                    html_report="<h1>Report</h1>",
+                    gmail_thread_id="thread_1",
+                    client_thread_id="client_thread",
+                    client_message_id="<reportops-client-run_1-existing@example.com>",
+                    last_am_review_sent_at=review_sent_at,
+                )
+            ],
+        )
+        store.messages = [
+            MessageRecord(
+                message_id="message_delivery",
+                run_id="run_1",
+                message_type="client_delivery",
+                to="ava@example.com",
+                subject="BrightSmile Dental Feb-2026 performance report",
+                gmail_message_id="gmail_delivery",
+                gmail_thread_id="client_thread",
+                status="sent",
+                created_at=datetime(2026, 6, 8, 10, 5, tzinfo=timezone.utc),
+            )
+        ]
+        store.gmail.inbound_messages = [
+            GmailInboundMessage(
+                message_id="gmail_approval_seen_again",
+                thread_id="thread_1",
+                subject="Re: report ready",
+                from_email="am@example.com",
+                headers={"references": "<reportops-run_1@local.reportops>"},
+                body="Approved",
+                snippet="Approved",
+                received_at=datetime.now(timezone.utc),
+            )
+        ]
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_report(), gmail=store.gmail)
+
+        workflow.sync_replies()
+
+        self.assertEqual(store.runs[0].status, RunStatus.CLIENT_DELIVERED)
+        self.assertEqual(store.gmail.sent_messages, [])
+        self.assertEqual(store.processed_message_ids, ["gmail_approval_seen_again"])
+
+    def test_repeated_client_deliveries_use_fresh_message_ids(self):
+        client = Client(
+            client_id="client_1",
+            client_name="BrightSmile Dental",
+            contact_name="Ava",
+            contact_email="ava@example.com",
+            account_manager_email="am@example.com",
+            cadence="monthly",
+            next_report_date=date(2026, 6, 8),
+        )
+        run = Run(
+            run_id="run_1",
+            client_id="client_1",
+            period="Feb-2026",
+            status=RunStatus.CLIENT_DELIVERED,
+            html_report="<h1>Report</h1>",
+        )
+        store = InMemorySheetStore(clients=[client], runs=[run])
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_report(), gmail=store.gmail)
+
+        workflow._send_client_report(client, run)
+        workflow._send_client_report(client, run)
+
+        first_message_id = message_from_string(store.gmail.sent_messages[0]["raw"])["Message-ID"]
+        second_message_id = message_from_string(store.gmail.sent_messages[1]["raw"])["Message-ID"]
+        self.assertNotEqual(first_message_id, second_message_id)
+        self.assertNotEqual(first_message_id, "<reportops-client-run_1@local.reportops>")
+        self.assertNotEqual(second_message_id, "<reportops-client-run_1@local.reportops>")
 
     def test_sync_replies_ignores_outbound_system_follow_up_in_am_thread(self):
         store = InMemorySheetStore(
@@ -1142,6 +1359,43 @@ class HeadlessWorkflowTests(unittest.TestCase):
         self.assertEqual(store.gmail.sent_messages[0]["subject"], "Re: BrightSmile Dental Feb-2026 performance report")
         self.assertIn("In-Reply-To: <reportops-client-run_1@local.reportops>", store.gmail.sent_messages[0]["raw"])
         self.assertIn("References: <reportops-client-run_1@local.reportops>", store.gmail.sent_messages[0]["raw"])
+
+    def test_client_question_answer_references_stored_client_delivery_message_id(self):
+        store = InMemorySheetStore(
+            clients=[
+                Client(
+                    client_id="client_1",
+                    client_name="BrightSmile Dental",
+                    contact_name="Ava",
+                    contact_email="ava@example.com",
+                    account_manager_email="am@example.com",
+                    cadence="monthly",
+                    next_report_date=date(2026, 6, 8),
+                )
+            ],
+            runs=[
+                Run(
+                    run_id="run_1",
+                    client_id="client_1",
+                    period="Feb-2026",
+                    status=RunStatus.CLIENT_DELIVERED,
+                    html_report="<h1>Report</h1>",
+                    client_thread_id="client_thread",
+                    client_message_id="<reportops-client-run_1-real123@example.com>",
+                )
+            ],
+        )
+        workflow = ReportingWorkflow(store=store, ai=OpenRouterClient.fake_report(), gmail=store.gmail)
+
+        workflow._send_client_question_answer(
+            store.clients[0],
+            store.runs[0],
+            "<p>ROAS means return on ad spend.</p>",
+        )
+
+        raw = store.gmail.sent_messages[0]["raw"]
+        self.assertIn("In-Reply-To: <reportops-client-run_1-real123@example.com>", raw)
+        self.assertIn("References: <reportops-client-run_1-real123@example.com>", raw)
 
     def test_email_builder_includes_html_and_tracking_headers(self):
         raw = build_raw_email(

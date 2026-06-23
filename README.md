@@ -14,6 +14,10 @@ In plain English:
 
 There is no dashboard or website to run. Google Sheets is the control panel.
 
+## Repository Hygiene
+
+This repo is intentionally Python-only. Stale frontend folders such as `.next/`, `node_modules/`, `app/`, `data/`, `artifacts/`, `.test-data/`, and `references/` are ignored local leftovers and can be deleted when cleaning the workspace. Keep `.env` and `.env.local` local and never print their values.
+
 ## What You Need Before Starting
 
 - A Google account.
@@ -145,7 +149,7 @@ GOOGLE_SHEETS_SPREADSHEET_ID=
 SYSTEM_SENDER_EMAIL=
 
 OPENROUTER_API_KEY=
-OPENROUTER_MODEL=openai/gpt-oss-120b:free
+OPENROUTER_MODEL=openai/gpt-4o-mini
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 
 # Optional instant Gmail reply detection.
@@ -161,7 +165,7 @@ What each value means:
 - `GOOGLE_SHEETS_SPREADSHEET_ID`: the long id from the Google Sheet URL.
 - `SYSTEM_SENDER_EMAIL`: the Gmail address that sends reports.
 - `OPENROUTER_API_KEY`: lets OpenRouter write the report content.
-- `OPENROUTER_MODEL`: the model used for reports. Keep the default unless you intentionally change models.
+- `OPENROUTER_MODEL`: the model used for reports. Use a paid model that supports OpenRouter structured outputs; `openai/gpt-4o-mini` is the recommended default.
 - `OPENROUTER_BASE_URL`: OpenRouter API URL. Keep the default.
 
 Do not commit `.env` or paste it into chat.
@@ -207,7 +211,7 @@ Paste these headers into row 1 of each tab.
 #### `Clients`
 
 ```text
-client_id, client_name, contact_name, contact_email, account_manager_email, cadence, next_report_date, status, run_now, paused, notes
+client_id, client_name, contact_name, contact_email, account_manager_email, support_email, cadence, next_report_date, status, run_now, paused, notes
 ```
 
 Important columns:
@@ -216,6 +220,7 @@ Important columns:
 - `client_name`: the client name shown in the report.
 - `contact_email`: the client's email address.
 - `account_manager_email`: the person who approves the report before the client sees it.
+- `support_email`: the internal support address that receives blocked-run error notices. For early demos, this can be the same address as the account manager; for production, use an internal operator/support inbox.
 - `next_report_date`: the next date this client should be checked, like `2026-06-08`.
 - `run_now`: type `TRUE` to force a report on the next run. The app clears this after the approved report is sent to the client.
 - `paused`: type `TRUE` to stop reports for that client.
@@ -223,7 +228,7 @@ Important columns:
 Example row:
 
 ```text
-client_brightsmile_dental, BrightSmile Dental, Ava, ava@example.com, am@example.com, monthly, 2026-06-08, active, TRUE, , Demo client
+client_brightsmile_dental, BrightSmile Dental, Ava, ava@example.com, am@example.com, support@example.com, monthly, 2026-06-08, active, TRUE, , Demo client
 ```
 
 #### `Metrics`
@@ -302,13 +307,13 @@ OPENROUTER_API_KEY=
 Keep these defaults unless you intentionally want to change models:
 
 ```text
-OPENROUTER_MODEL=openai/gpt-oss-120b:free
+OPENROUTER_MODEL=openai/gpt-4o-mini
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 ```
 
-If OpenRouter is unavailable, rate-limited, or returns invalid report data, the app blocks the run and does not send the report.
+If OpenRouter is unavailable, rate-limited, or returns invalid report data, the app blocks only that client's run, sends the blocked-run notice to the client's `support_email`, and does not send an AM review or client report.
 
-`GMAIL_PUBSUB_TOPIC` and `GMAIL_PUBSUB_TOKEN` are optional. Leave them blank if you only want the normal five-minute Gmail reply checks.
+`GMAIL_PUBSUB_TOPIC` and `GMAIL_PUBSUB_TOKEN` are optional. The current deployment is configured for Gmail Pub/Sub reply detection; the five-minute Gmail reply poller exists as a fallback function but is not scheduled unless you explicitly enable its Modal cron at deploy time.
 
 ## 5. Deploy To Modal
 
@@ -341,7 +346,7 @@ modal secret create reportops-secrets --from-dotenv .env --force
 If your Modal CLI version does not support `--from-dotenv`, create it by passing the values manually. Include the optional Pub/Sub values only if you are enabling instant Gmail reply detection:
 
 ```powershell
-modal secret create reportops-secrets GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... GOOGLE_REFRESH_TOKEN=... GOOGLE_SHEETS_SPREADSHEET_ID=... SYSTEM_SENDER_EMAIL=... OPENROUTER_API_KEY=... OPENROUTER_MODEL=openai/gpt-oss-120b:free OPENROUTER_BASE_URL=https://openrouter.ai/api/v1 GMAIL_PUBSUB_TOPIC=... GMAIL_PUBSUB_TOKEN=... --force
+modal secret create reportops-secrets GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... GOOGLE_REFRESH_TOKEN=... GOOGLE_SHEETS_SPREADSHEET_ID=... SYSTEM_SENDER_EMAIL=... OPENROUTER_API_KEY=... OPENROUTER_MODEL=openai/gpt-4o-mini OPENROUTER_BASE_URL=https://openrouter.ai/api/v1 GMAIL_PUBSUB_TOPIC=... GMAIL_PUBSUB_TOKEN=... --force
 ```
 
 ### Deploy The App
@@ -352,9 +357,9 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal deploy mod
 
 ## 6. Optional Instant Gmail Reply Detection
 
-The normal workflow checks Gmail replies every five minutes during the configured UTC business-hours window. For demos, you can also enable Gmail push notifications so replies trigger processing almost immediately.
+The current workflow uses Gmail push notifications so replies trigger processing almost immediately. A five-minute Gmail reply poller still exists as a fallback function, but its Modal cron is currently not deployed by default.
 
-Gmail does not send the full email body to Modal. It sends a mailbox-change notification through Google Pub/Sub, then Modal fetches the relevant Gmail threads and uses the same reply-processing logic as the scheduled poller.
+Gmail does not send the full email body to Modal. It sends a mailbox-change notification through Google Pub/Sub, then Modal fetches the relevant Gmail threads and uses the same reply-processing logic as `poll_gmail_replies`.
 
 ### Set Up Google Pub/Sub
 
@@ -483,7 +488,19 @@ Run:
 $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal run modal_app.py::renew_gmail_watch
 ```
 
-Gmail watches expire, so the app also renews the watch daily at `0 1 * * *` UTC. Keep the scheduled five-minute reply checker enabled as the fallback.
+Gmail watches expire, so the app also renews the watch daily at `0 1 * * *` UTC.
+
+The five-minute reply checker is currently not scheduled. To restore it as a Modal cron fallback, deploy with this environment variable set in the deploy shell:
+
+```powershell
+$env:REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE='1'; $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal deploy modal_app.py
+```
+
+You can still run the function manually at any time:
+
+```powershell
+py -3.13 -m modal run modal_app.py::poll_gmail_replies
+```
 
 Important: `Never expire` on the Pub/Sub subscription keeps the subscription alive. It does not make the Gmail watch permanent. Gmail watches still expire separately, and the app renews them daily.
 
@@ -528,7 +545,8 @@ Manual all-client runs can take several minutes because reports are generated on
 After deployment:
 
 - Daily reports run at `0 0 * * *` UTC.
-- Gmail replies are checked every five minutes during UTC hours `09:00` through `18:59`.
+- Gmail replies are processed immediately through Gmail Pub/Sub when push notifications are configured.
+- `poll_gmail_replies` exists as a manual/fallback function. Its five-minute Modal cron (`*/5 9-18 * * *`) is not deployed by default right now; set `REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE=1` before deploy to restore the schedule.
 - Gmail push notification watches are renewed daily at `0 1 * * *` UTC when `GMAIL_PUBSUB_TOPIC` is configured.
 - `run_now` is for forcing scheduled runs. The manual `run_now` Modal command runs non-paused clients even if this Sheet value is blank.
 
@@ -567,6 +585,7 @@ Check these first:
 - The report period has matching rows in `Metrics`.
 - For scheduled runs, the client is due or `run_now` is set to `TRUE`. For manual `run_now`, the client is not paused.
 - `account_manager_email` is correct.
+- `support_email` is filled in if you want blocked-run error notices.
 - `SYSTEM_SENDER_EMAIL` is the Gmail account that was authorized.
 - The run was not blocked in the `Runs` tab.
 
