@@ -8,9 +8,9 @@ In plain English:
 2. The app checks which clients need reports.
 3. OpenRouter writes the report as an HTML email.
 4. Gmail sends the report to the account manager first.
-5. The account manager replies `Approved`.
+5. The account manager replies with a clear approval such as `Approved`, `Great`, or `Looks good`.
 6. Gmail sends the approved report to the client.
-7. The app keeps checking report email threads for replies and follows up with the account manager if a review waits too long.
+7. The app keeps checking report email threads for replies, answers low-risk client questions in the same Gmail thread, and follows up with the account manager if a review waits too long.
 
 There is no dashboard or website to run. Google Sheets is the control panel.
 
@@ -256,7 +256,7 @@ client_brightsmile_dental, BrightSmile Dental, Feb-2026, 3450, 131000, 3290, 2.5
 #### `Runs`
 
 ```text
-run_id, client_id, period, status, attempt_count, last_error, am_review_notes, html_report, gmail_thread_id, client_thread_id, created_at, updated_at, approved_at, delivered_at, last_am_review_sent_at
+run_id, client_id, period, status, attempt_count, last_error, am_review_notes, html_report, gmail_thread_id, client_thread_id, client_message_id, created_at, updated_at, approved_at, delivered_at, last_am_review_sent_at
 ```
 
 You normally do not fill this tab manually. The app writes report run state here.
@@ -268,6 +268,7 @@ Useful columns:
 - `html_report`: the generated report body.
 - `gmail_thread_id`: the account-manager review email thread.
 - `client_thread_id`: the client email thread.
+- `client_message_id`: the RFC `Message-ID` of the client delivery email. The app uses this as a fallback for Gmail reply headers.
 - `last_am_review_sent_at`: the last time the app sent the first AM review or a follow-up reminder.
 
 #### `Messages`
@@ -283,12 +284,17 @@ This tab helps prevent duplicate reply processing.
 #### `Questions`
 
 ```text
-question_id, run_id, client_id, question, risk_level, answer_html, status, created_at, sent_at
+question_id, run_id, client_id, question, risk_level, answer_html, status, gmail_thread_id, client_reply_message_id, created_at, sent_at
 ```
 
 You normally do not fill this tab manually. The app writes client questions and AI-drafted answers here.
 
 Low-risk questions can be answered automatically. High-risk questions go to the account manager first.
+
+Useful columns:
+
+- `gmail_thread_id`: the exact Gmail thread where the client asked the question.
+- `client_reply_message_id`: the RFC `Message-ID` of the client's question email. Client answers use this for `In-Reply-To` and `References` so replies stay in the same Gmail conversation.
 
 ## 4. Add OpenRouter
 
@@ -313,7 +319,7 @@ OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 
 If OpenRouter is unavailable, rate-limited, or returns invalid report data, the app blocks only that client's run, sends the blocked-run notice to the client's `support_email`, and does not send an AM review or client report.
 
-`GMAIL_PUBSUB_TOPIC` and `GMAIL_PUBSUB_TOKEN` are optional. The current deployment is configured for Gmail Pub/Sub reply detection; the five-minute Gmail reply poller exists as a fallback function but is not scheduled unless you explicitly enable its Modal cron at deploy time.
+`GMAIL_PUBSUB_TOPIC` and `GMAIL_PUBSUB_TOKEN` are optional. The current deployment is configured for Gmail Pub/Sub reply detection; the five-minute Gmail reply poller exists as a manual fallback function and is not attached to a Modal cron.
 
 ## 5. Deploy To Modal
 
@@ -357,7 +363,7 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal deploy mod
 
 ## 6. Optional Instant Gmail Reply Detection
 
-The current workflow uses Gmail push notifications so replies trigger processing almost immediately. A five-minute Gmail reply poller still exists as a fallback function, but its Modal cron is currently not deployed by default.
+The current workflow uses Gmail push notifications so replies trigger processing almost immediately. A five-minute Gmail reply poller still exists as a manual fallback function, but it does not run on a Modal cron.
 
 Gmail does not send the full email body to Modal. It sends a mailbox-change notification through Google Pub/Sub, then Modal fetches the relevant Gmail threads and uses the same reply-processing logic as `poll_gmail_replies`.
 
@@ -490,13 +496,7 @@ $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal run modal_
 
 Gmail watches expire, so the app also renews the watch daily at `0 1 * * *` UTC.
 
-The five-minute reply checker is currently not scheduled. To restore it as a Modal cron fallback, deploy with this environment variable set in the deploy shell:
-
-```powershell
-$env:REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE='1'; $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal deploy modal_app.py
-```
-
-You can still run the function manually at any time:
+The five-minute reply checker is manual-only. Run it manually when you want a fallback reply check:
 
 ```powershell
 py -3.13 -m modal run modal_app.py::poll_gmail_replies
@@ -546,11 +546,11 @@ After deployment:
 
 - Daily reports run at `0 0 * * *` UTC.
 - Gmail replies are processed immediately through Gmail Pub/Sub when push notifications are configured.
-- `poll_gmail_replies` exists as a manual/fallback function. Its five-minute Modal cron (`*/5 9-18 * * *`) is not deployed by default right now; set `REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE=1` before deploy to restore the schedule.
+- `poll_gmail_replies` exists as a manual/fallback function. It has no Modal cron and must be run manually when needed.
 - Gmail push notification watches are renewed daily at `0 1 * * *` UTC when `GMAIL_PUBSUB_TOPIC` is configured.
 - `run_now` is for forcing scheduled runs. The manual `run_now` Modal command runs non-paused clients even if this Sheet value is blank.
 
-The account manager must reply `Approved` before the client gets the report.
+The account manager must reply with a clear approval before the client gets the report. Supported short approval replies include `Approved`, `Great`, `Looks good`, `Good to go`, `All good`, `Send it`, and `Go ahead`. If the app cannot tell whether the account manager approved the report or requested changes, it sends the account manager a clarification request in the same Gmail thread.
 
 After the client report is sent, the app clears `run_now` and advances `next_report_date` by one month.
 
@@ -559,6 +559,8 @@ If a daily run finds that a same-period report is already waiting for account-ma
 This duplicate protection is only for the same report period. For example, an open `Feb-2026` AM review does not block a later `Mar-2026` report.
 
 Manual `run_now` commands are explicit retries and can regenerate/resend same-period AM reviews. Without `--client-id`, the command runs every non-paused client.
+
+Client replies become Q&A. Simple metric-definition questions such as "What does ROAS mean?" are treated as low-risk and auto-answered. Complaints, budget/strategy requests, guarantees, legal/compliance questions, and metric-discrepancy language route to account-manager review. Client Q&A answers use the original client question's Gmail thread and message headers so they stay in the same conversation.
 
 ## Optional Developer Checks
 
@@ -597,7 +599,7 @@ Example: if the run is for `May-2026`, the client needs a `Metrics` row with `mo
 
 ### Report Is Waiting
 
-The account-manager review email was sent, but the client will not receive the report until the account manager replies with `Approved`.
+The account-manager review email was sent, but the client will not receive the report until the account manager sends a clear approval reply such as `Approved`, `Great`, or `Looks good`.
 
 If the report is still waiting during the next daily run and the last AM review or reminder is more than 24 hours old, the app sends the account manager a follow-up. It does not create a new report for the same period unless you run an explicit manual retry.
 

@@ -22,7 +22,6 @@ class ModalEntrypointTests(unittest.TestCase):
         self.assertEqual(
             modal_app.SCHEDULE_PLAN,
             {
-                "poll_gmail_replies": "*/5 9-18 * * *",
                 "run_daily_reports": "0 0 * * *",
                 "renew_gmail_watch": "0 1 * * *",
                 "run_now": None,
@@ -30,22 +29,21 @@ class ModalEntrypointTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(modal_app, "scheduled_tick"))
 
-    def test_gmail_reply_poller_schedule_is_not_deployed_by_default(self):
+    def test_gmail_reply_poller_is_manual_only(self):
         with patch.dict(modal_app.os.environ, {}, clear=True):
             self.assertFalse(modal_app._deploy_schedule("poll_gmail_replies"))
             self.assertTrue(modal_app._deploy_schedule("run_daily_reports"))
             self.assertTrue(modal_app._deploy_schedule("renew_gmail_watch"))
 
-    def test_gmail_reply_poller_schedule_can_be_deployed_by_env(self):
-        with patch.dict(modal_app.os.environ, {"REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE": "1"}, clear=True):
-            self.assertTrue(modal_app._deploy_schedule("poll_gmail_replies"))
+    def test_gmail_reply_poller_schedule_cannot_be_deployed_by_env(self):
+        with patch.dict(modal_app.os.environ, {"REPORTOPS_DEPLOY_SCHEDULES": "1"}, clear=True):
+            self.assertFalse(modal_app._deploy_schedule("poll_gmail_replies"))
 
     def test_global_schedule_disable_still_disables_all_schedules(self):
         with patch.dict(
             modal_app.os.environ,
             {
                 "REPORTOPS_DEPLOY_SCHEDULES": "0",
-                "REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE": "1",
             },
             clear=True,
         ):

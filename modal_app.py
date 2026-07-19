@@ -11,7 +11,6 @@ from reportops.workflow import ReportingWorkflow
 
 
 SCHEDULE_PLAN = {
-    "poll_gmail_replies": "*/5 9-18 * * *",
     "run_daily_reports": "0 0 * * *",
     "renew_gmail_watch": "0 1 * * *",
     "run_now": None,
@@ -41,7 +40,7 @@ def _deploy_schedule(schedule_name: str) -> bool:
     if os.getenv("REPORTOPS_DEPLOY_SCHEDULES", "1") == "0":
         return False
     if schedule_name == "poll_gmail_replies":
-        return os.getenv("REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE", "").strip() == "1"
+        return False
     return True
 
 
@@ -53,10 +52,7 @@ if modal is not None:
     def modal_function(**kwargs):
         return app.function(image=image, secrets=[secret], **kwargs)
 
-    if _deploy_schedule("poll_gmail_replies"):
-        poll_schedule = modal_function(schedule=modal.Cron(SCHEDULE_PLAN["poll_gmail_replies"]))
-    else:
-        poll_schedule = modal_function()
+    poll_schedule = modal_function(schedule=None)
     if _deploy_schedule("run_daily_reports"):
         daily_schedule = modal_function(schedule=modal.Cron(SCHEDULE_PLAN["run_daily_reports"]))
     else:

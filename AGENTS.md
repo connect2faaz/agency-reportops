@@ -26,7 +26,7 @@ If a scheduled daily run finds an existing same-period `am_review` run for the c
 
 Reply polling flow:
 
-Active run Gmail thread IDs -> fetch only those Gmail threads -> ignore already processed Gmail message IDs -> match by headers/thread/body marker -> AM approval sends client report -> AM change request regenerates and resends to AM -> client replies become Q&A -> low-risk auto-reply in the same client email thread or high-risk AM review.
+Active run Gmail thread IDs -> fetch only those Gmail threads -> ignore already processed Gmail message IDs -> match by headers/thread/body marker -> AM approval sends client report -> AM change request regenerates and resends to AM -> unclear AM replies get a clarification request in the same AM thread -> client replies become Q&A -> low-risk auto-reply in the same client email thread or high-risk AM review.
 
 Optional Gmail Pub/Sub push flow:
 
@@ -52,7 +52,11 @@ If OpenRouter is unavailable, rate-limited, or returns invalid structured output
 
 Report generation returns a JSON envelope for validation, but the client-facing content is `html_report`. The report prompt requires a stable HTML structure rooted at `div.report-shell` with fixed section class names and inline styles so email layout stays consistent across generations.
 
-Client Q&A uses a separate OpenRouter structured-output prompt with `intent`, `risk_level`, `risk_reason`, `answer_html`, and `requires_am_review`. Low-risk report/metric explanations are auto-sent immediately. High-risk, unclear, complaint, budget/strategy, guarantee, legal/compliance, and metric-discrepancy messages route to account-manager review.
+AM approval detection is deterministic and accepts concise positive replies such as `Approved`, `Great`, `Looks good`, `Good to go`, `All good`, `Send it`, and `Go ahead`. Change-request language such as `change`, `revise`, `edit`, `update`, `fix`, `remove`, or `not approved` regenerates and resends the AM review. Ambiguous AM replies do not silently stop; the app sends a clarification request in the same Gmail thread.
+
+Client Q&A uses a separate OpenRouter structured-output prompt with `intent`, `risk_level`, `risk_reason`, `answer_html`, and `requires_am_review`. Low-risk report/metric explanations are auto-sent immediately. Simple metric-definition questions, including ROAS/CTR/CPL/CPA/CPC/CPM definitions, are answered deterministically as low-risk before relying on AI risk output. High-risk, unclear, complaint, budget/strategy, guarantee, legal/compliance, and metric-discrepancy messages route to account-manager review.
+
+Client Q&A replies must stay in the same Gmail conversation. Store the client question's Gmail thread in `Questions.gmail_thread_id` and the client's RFC `Message-ID` in `Questions.client_reply_message_id`; use those values for Gmail `threadId`, `In-Reply-To`, and `References` when sending the answer. Fall back to `Runs.client_thread_id` and `Runs.client_message_id` only for legacy rows that lack question-level values.
 
 ## Important Files
 
@@ -78,7 +82,7 @@ Required tabs:
 - `Messages`
 - `Questions`
 
-The workflow never infers client grouping from row order. Always join by `client_id`, `run_id`, Gmail `thread_id`, or stored Gmail message IDs.
+The workflow never infers client grouping from row order. Always join by `client_id`, `run_id`, Gmail `thread_id`, or stored Gmail message IDs. The `Questions` tab includes `gmail_thread_id` and `client_reply_message_id` so client Q&A answers can reply to the exact original client question thread/message.
 
 Recommended `Metrics.month` format is `Feb-2026`, although the parser accepts several date-like formats. A run without `--period` uses the previous month, so test/demo Sheet data must include that month or the run will block with no emails sent.
 
@@ -149,12 +153,6 @@ Deploy:
 $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal deploy modal_app.py
 ```
 
-Deploy with the five-minute Gmail reply poller schedule restored:
-
-```powershell
-$env:REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE='1'; $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'; py -3.13 -m modal deploy modal_app.py
-```
-
 Renew Gmail Pub/Sub watch manually:
 
 ```powershell
@@ -184,7 +182,7 @@ Manual all-client runs generate reports sequentially and can take several minute
 ## Modal Schedules
 
 - Daily reports: `0 0 * * *` UTC.
-- Gmail reply polling: currently not scheduled by default. `poll_gmail_replies` still exists and works manually; set `REPORTOPS_DEPLOY_GMAIL_REPLY_POLLER_SCHEDULE=1` before deploy to restore its `*/5 9-18 * * *` cron.
+- Gmail reply polling: `poll_gmail_replies` is manual-only and has no Modal cron. Run it manually when the Pub/Sub path needs a fallback check.
 - Gmail watch renewal: `0 1 * * *` UTC. This keeps optional Gmail Pub/Sub push notifications active.
 - `run_now` is a manual Modal function only; it is not scheduled.
 
@@ -195,13 +193,14 @@ Manual all-client runs generate reports sequentially and can take several minute
 - No ad-platform integrations in v1; Google Ads and Meta Ads should be added later behind a data-source adapter.
 - Keep Google Sheets as the v1 control and state plane.
 - Preserve `Runs` timestamp fields when loading from and flushing back to Sheets. Do not rewrite historical `created_at`, `updated_at`, `approved_at`, or `delivered_at` values merely because a later Modal function loaded and flushed the workbook.
+- Preserve `Questions` timestamp fields and threading fields when loading from and flushing back to Sheets. Do not rewrite historical `created_at` or `sent_at`, and do not drop `gmail_thread_id` or `client_reply_message_id`.
 - Preserve duplicate protection through processed Gmail message IDs.
 - Keep reply matching strict: headers first, then stored Gmail thread IDs, then body fallback markers. Do not reintroduce the old "only active run" fallback.
 - Poll active Gmail threads directly. Do not rely on broad subject search for normal reply processing.
-- Treat Gmail Pub/Sub as a wake-up accelerator, not the source of email contents. Do not remove the `poll_gmail_replies` fallback function; its Modal cron is intentionally disabled by default for current Pub/Sub testing.
+- Treat Gmail Pub/Sub as a wake-up accelerator, not the source of email contents. Do not remove the `poll_gmail_replies` fallback function; it is intentionally manual-only and must not be attached to a Modal cron.
 - Protect the Pub/Sub webhook with `GMAIL_PUBSUB_TOKEN`; do not make it unauthenticated.
 - Do not persist or rely on Gmail history IDs in v1 unless a deliberate history-cursor design is added.
 - Keep hidden fallback markers in outgoing HTML, but do not show raw run IDs visibly to clients.
 - Keep same-period AM review suppression and 24-hour AM follow-up reminders. Do not reintroduce daily scheduled OpenRouter regeneration for an already open same-period `am_review` run.
-- Auto-answer only low-risk client Q&A. Escalate unhappy-client language and metric discrepancies to account-manager review.
+- Auto-answer only low-risk client Q&A. Escalate unhappy-client language and metric discrepancies to account-manager review. Keep deterministic low-risk definitions for simple metric acronym questions.
 - Do not send reports when AI output validation fails after all configured structured-output retry/repair attempts.
