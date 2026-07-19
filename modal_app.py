@@ -37,11 +37,7 @@ def _noop_decorator(func=None, *_args, **_kwargs):
 
 
 def _deploy_schedule(schedule_name: str) -> bool:
-    if os.getenv("REPORTOPS_DEPLOY_SCHEDULES", "1") == "0":
-        return False
-    if schedule_name == "poll_gmail_replies":
-        return False
-    return True
+    return os.getenv("REPORTOPS_DEPLOY_SCHEDULES", "1") != "0"
 
 
 if modal is not None:
@@ -52,7 +48,7 @@ if modal is not None:
     def modal_function(**kwargs):
         return app.function(image=image, secrets=[secret], **kwargs)
 
-    poll_schedule = modal_function(schedule=None)
+    poll_schedule = modal_function()
     if _deploy_schedule("run_daily_reports"):
         daily_schedule = modal_function(schedule=modal.Cron(SCHEDULE_PLAN["run_daily_reports"]))
     else:
