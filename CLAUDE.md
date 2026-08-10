@@ -1,4 +1,4 @@
-# AGENTS.md
+# CLAUDE.md
 
 Compressed handoff for agents working in this workspace.
 

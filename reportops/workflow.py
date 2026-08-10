@@ -22,6 +22,33 @@ from .models import Client, MessageRecord, MetricRow, Question, Run, RunStatus, 
 HIDDEN_REFERENCE_STYLE = "display:none;color:#ffffff;font-size:1px;line-height:1px;opacity:0;max-height:0;overflow:hidden;"
 AM_FOLLOW_UP_INTERVAL = timedelta(hours=24)
 
+BLOCK_REASON_MISSING_METRICS = "missing_metrics"
+BLOCK_REASON_AI_FAILURE = "ai_failure"
+BLOCK_REASON_UNEXPECTED = "unexpected"
+
+# A blocked run is retried by the daily schedule instead of waiting for a manual run_now.
+# Retrying a missing-metrics block costs nothing because the metrics lookup happens before
+# the OpenRouter call, so it gets a long budget. AI failures cost money per attempt.
+BLOCKED_MAX_ATTEMPTS = {
+    BLOCK_REASON_MISSING_METRICS: 45,
+    BLOCK_REASON_AI_FAILURE: 5,
+    BLOCK_REASON_UNEXPECTED: 5,
+}
+# Slightly under 24h so a daily cron that drifts later never skips a day.
+BLOCKED_RETRY_MIN_INTERVAL = timedelta(hours=20)
+
+# Retries are cheap, support notices are not. Notify on attempts 1, 4, 7, 10, 13 and then
+# keep retrying silently, so one stuck run can never send more than a handful of emails.
+SUPPORT_NOTICE_ATTEMPT_INTERVAL = 3
+SUPPORT_NOTICE_ATTEMPT_LIMIT = 13
+
+# How long a run's Gmail threads stay eligible for reply polling, measured from run creation.
+# `GoogleSheetsStore.flush()` reuses this exact value to expire processed-reply markers, which
+# is what makes pruning them safe: Gmail thread fetches return every message in a thread with
+# no date filter, so a marker may only be dropped once its thread is no longer polled at all.
+# These two windows must stay equal. Do not change one without the other.
+REPLY_RETENTION = timedelta(days=90)
+
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(6)}"
@@ -174,14 +201,27 @@ class ReportingWorkflow:
                 run = Run(run_id=new_id("run"), client_id=client.client_id, period=period, status=RunStatus.BLOCKED)
                 run.attempt_count = 1
                 self.store.runs.append(run)
-            self._block_run(client, run, f"Unexpected report run failure: {type(error).__name__}: {error}")
+            self._block_run(
+                client,
+                run,
+                f"Unexpected report run failure: {type(error).__name__}: {error}",
+                BLOCK_REASON_UNEXPECTED,
+            )
 
     def _start_or_retry_report(self, client: Client, period: str, force: bool = False) -> None:
         run = self.store.run_for_report_period(client.client_id, period)
         if run is not None and not force:
             if run.status == RunStatus.AM_REVIEW:
                 self._send_am_follow_up_if_due(client, run)
-            return
+                return
+            if run.status != RunStatus.BLOCKED:
+                return
+            decision = self._blocked_retry_decision(run)
+            if decision == "exhausted":
+                self._abandon_blocked_run(client, run)
+                return
+            if decision != "retry":
+                return
         if run is None:
             run = Run(run_id=new_id("run"), client_id=client.client_id, period=period, status=RunStatus.AM_REVIEW)
             self.store.runs.append(run)
@@ -189,23 +229,73 @@ class ReportingWorkflow:
         run.updated_at = utc_now()
         metrics = self.store.metrics_for_report_period(client.client_id, period)
         if not metrics:
-            self._block_run(client, run, f"No metrics found for client_id={client.client_id} period={period}.")
+            self._block_run(
+                client,
+                run,
+                f"No metrics found for client_id={client.client_id} period={period}.",
+                BLOCK_REASON_MISSING_METRICS,
+            )
             return
         try:
             report = self.ai.generate_report(client, metrics, run.am_review_notes)
         except StructuredOutputError as error:
-            self._block_run(client, run, str(error))
+            self._block_run(client, run, str(error), BLOCK_REASON_AI_FAILURE)
             return
         run.status = RunStatus.AM_REVIEW
         run.last_error = ""
+        run.block_reason = ""
+        run.retry_abandoned = False
         run.html_report = report.html_report
         self._send_am_review(client, run)
 
-    def _block_run(self, client: Client, run: Run, error_message: str) -> None:
+    def _block_run(self, client: Client, run: Run, error_message: str, reason: str) -> None:
         run.status = RunStatus.BLOCKED
         run.last_error = error_message
+        run.block_reason = reason
         run.updated_at = utc_now()
-        self._send_support_error(client, run, error_message)
+        if self._support_notice_is_due(run):
+            self._send_support_error(client, run, error_message)
+
+    @staticmethod
+    def _resolved_block_reason(run: Run) -> str:
+        """Reason for a blocked run, inferring it for rows written before block_reason existed."""
+        reason = (run.block_reason or "").strip()
+        if reason in BLOCKED_MAX_ATTEMPTS:
+            return reason
+        if run.last_error.startswith("No metrics found"):
+            return BLOCK_REASON_MISSING_METRICS
+        return BLOCK_REASON_UNEXPECTED
+
+    @staticmethod
+    def _support_notice_is_due(run: Run) -> bool:
+        """Notify on attempts 1, 4, 7, 10, 13, then stay quiet while retries continue."""
+        if run.attempt_count > SUPPORT_NOTICE_ATTEMPT_LIMIT:
+            return False
+        return run.attempt_count % SUPPORT_NOTICE_ATTEMPT_INTERVAL == 1
+
+    def _blocked_retry_decision(self, run: Run) -> str:
+        if run.retry_abandoned:
+            return "wait"
+        max_attempts = BLOCKED_MAX_ATTEMPTS[self._resolved_block_reason(run)]
+        if run.attempt_count >= max_attempts:
+            return "exhausted"
+        if utc_now() - run.updated_at < BLOCKED_RETRY_MIN_INTERVAL:
+            return "wait"
+        return "retry"
+
+    def _abandon_blocked_run(self, client: Client, run: Run) -> None:
+        run.retry_abandoned = True
+        run.updated_at = utc_now()
+        reason = self._resolved_block_reason(run)
+        self._send_support_error(
+            client,
+            run,
+            (
+                f"{run.last_error} Automatic retries stopped after {run.attempt_count} attempts "
+                f"({reason}). No further notices will be sent for this run. Fix the underlying "
+                f"issue and use a manual run_now to retry, or pause the client."
+            ),
+        )
 
     def _send_support_error(self, client: Client, run: Run, error_message: str) -> None:
         support_email = client.support_email.strip()
@@ -540,7 +630,12 @@ class ReportingWorkflow:
 
     def _active_thread_ids(self) -> list[str]:
         thread_ids = []
+        cutoff = utc_now() - REPLY_RETENTION
         for run in self.store.runs:
+            # Measured from creation, not last activity, so a long-running thread cannot outlive
+            # the processed-reply markers that stop its older messages being handled twice.
+            if run.created_at < cutoff:
+                continue
             if run.status == RunStatus.AM_REVIEW and run.gmail_thread_id:
                 thread_ids.append(run.gmail_thread_id)
             elif run.status == RunStatus.CLIENT_DELIVERED and run.client_thread_id:

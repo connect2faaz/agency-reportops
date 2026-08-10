@@ -149,6 +149,8 @@ class Run:
     approved_at: datetime | None = None
     delivered_at: datetime | None = None
     last_am_review_sent_at: datetime | None = None
+    block_reason: str = ""
+    retry_abandoned: bool = False
 
 
 @dataclass(slots=True)

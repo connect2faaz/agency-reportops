@@ -256,15 +256,17 @@ client_brightsmile_dental, BrightSmile Dental, Feb-2026, 3450, 131000, 3290, 2.5
 #### `Runs`
 
 ```text
-run_id, client_id, period, status, attempt_count, last_error, am_review_notes, html_report, gmail_thread_id, client_thread_id, client_message_id, created_at, updated_at, approved_at, delivered_at, last_am_review_sent_at
+run_id, client_id, period, status, attempt_count, last_error, am_review_notes, html_report, gmail_thread_id, client_thread_id, client_message_id, created_at, updated_at, approved_at, delivered_at, last_am_review_sent_at, block_reason, retry_abandoned
 ```
 
-You normally do not fill this tab manually. The app writes report run state here.
+You normally do not fill this tab manually. The app writes report run state here. If your workbook predates the `block_reason` and `retry_abandoned` columns, the app adds them for you on its next write.
 
 Useful columns:
 
 - `status`: where the report is in the workflow.
 - `last_error`: why a run was blocked or failed.
+- `block_reason`: the category of a block. `missing_metrics` means the `Metrics` rows are absent, and `ai_failure` means report generation failed.
+- `retry_abandoned`: `TRUE` once the app has stopped retrying a blocked run on its own. A manual run still works.
 - `html_report`: the generated report body.
 - `gmail_thread_id`: the account-manager review email thread.
 - `client_thread_id`: the client email thread.
@@ -280,6 +282,10 @@ message_id, run_id, type, to, subject, gmail_message_id, gmail_thread_id, status
 You normally do not fill this tab manually. The app writes sent messages and processed replies here.
 
 This tab helps prevent duplicate reply processing.
+
+Rows with a `type` of `processed_reply` are not history. They are small markers that say "this email was already handled", so the same reply is never acted on twice. The app deletes markers older than 90 days on its own, which stops this tab from growing forever. Every other row type is kept permanently as your record of what was sent.
+
+You do not need to clean this tab up by hand, and you should not delete rows other than expired markers.
 
 #### `Questions`
 
@@ -596,6 +602,23 @@ Check these first:
 Add rows to the `Metrics` tab for that client and report month.
 
 Example: if the run is for `May-2026`, the client needs a `Metrics` row with `month` set to `May-2026`.
+
+You do not need to re-run anything by hand. Once the rows are in the Sheet, the next daily run picks them up and sends the report automatically, usually within a day.
+
+### A Blocked Run Keeps Emailing Support
+
+A blocked run retries itself on the daily schedule instead of sitting still. It emails your `support_email` on the 1st, 4th, 7th, 10th, and 13th attempt and then goes quiet, while still retrying in the background. If it never recovers, it stops after its attempt budget and sends one last "giving up" email. A single stuck run will never send more than six emails in total.
+
+To stop it sooner:
+
+- Fix the cause, usually by adding the missing `Metrics` rows. The next retry succeeds and the emails stop.
+- Or set `paused` to `TRUE` for that client in the `Clients` tab, which removes it from the schedule entirely.
+
+The `Runs` tab shows why a run is stuck in the `block_reason` column, and `retry_abandoned` is set to `TRUE` once the app has given up on it. A manual run always retries, even an abandoned run:
+
+```powershell
+py -3.13 -m modal run modal_app.py::run_now --client-id client_brightsmile_dental --period Jul-2026
+```
 
 ### Report Is Waiting
 

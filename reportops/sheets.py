@@ -8,8 +8,23 @@ from typing import Any, Protocol
 from urllib import parse, request
 
 from .google_auth import refresh_google_access_token
-from .models import Client, MessageRecord, MetricRow, Question, Run, RunStatus, parse_datetime, utc_now
-from .workflow import InMemorySheetStore
+from .models import (
+    Client,
+    MessageRecord,
+    MetricRow,
+    Question,
+    Run,
+    RunStatus,
+    parse_bool,
+    parse_datetime,
+    utc_now,
+)
+from .workflow import REPLY_RETENTION, InMemorySheetStore
+
+
+# Every tab is read whole and rewritten from A1, so a read that stops short would silently
+# strand rows below the rewritten block. Keep this far above any realistic tab size.
+MAX_SHEET_ROWS = 50000
 
 
 class SheetClient(Protocol):
@@ -26,9 +41,12 @@ class GoogleSheetsApiClient:
         if not self.spreadsheet_id:
             raise RuntimeError("GOOGLE_SHEETS_SPREADSHEET_ID is required.")
         self.access_token_provider = access_token_provider
+        # Row counts seen on read, so a later write that shrinks a tab can blank the leftovers.
+        self._last_row_counts: dict[str, int] = {}
 
     def read_rows(self, tab_name: str) -> list[dict[str, str]]:
-        values = self._request("GET", f"{tab_name}!A1:Z1000").get("values", [])
+        values = self._request("GET", f"{tab_name}!A1:Z{MAX_SHEET_ROWS}").get("values", [])
+        self._last_row_counts[tab_name] = len(values)
         if not values:
             return []
         headers = [str(header).strip() for header in values[0]]
@@ -41,7 +59,13 @@ class GoogleSheetsApiClient:
     def replace_rows(self, tab_name: str, rows: list[dict[str, str]]) -> None:
         headers = _headers_for_tab(tab_name)
         values = [headers] + [[row.get(header, "") for header in headers] for row in rows]
+        # Writing fewer rows than the tab already holds would leave the old tail in place, so
+        # pad with blanks out to the previous extent and overwrite it.
+        blank_row = [""] * len(headers)
+        while len(values) < self._last_row_counts.get(tab_name, 0):
+            values.append(list(blank_row))
         self._request("PUT", f"{tab_name}!A1", {"values": values})
+        self._last_row_counts[tab_name] = len(values)
 
     def _request(self, method: str, range_name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         token = self.access_token_provider()
@@ -91,7 +115,29 @@ class GoogleSheetsStore(InMemorySheetStore):
             )
         return created
 
+    def prune_processed_markers(self, now: datetime | None = None) -> int:
+        """Drop processed-reply markers older than the reply-retention window.
+
+        Safe only because `ReportingWorkflow._active_thread_ids()` stops polling a run's threads
+        after the same window, so an expired marker can no longer be re-surfaced by Gmail. Real
+        message records are never pruned; they are the audit trail.
+        """
+        cutoff = (now or utc_now()) - REPLY_RETENTION
+        kept = [
+            message
+            for message in self.messages
+            if message.message_type != "processed_reply" or message.created_at >= cutoff
+        ]
+        removed = len(self.messages) - len(kept)
+        if removed:
+            self.messages = kept
+            self.processed_message_ids = [
+                message.gmail_message_id for message in kept if message.message_type == "processed_reply"
+            ]
+        return removed
+
     def flush(self) -> None:
+        self.prune_processed_markers()
         self.sheet_client.replace_rows("Runs", [_run_to_row(run) for run in self.runs])
         self.sheet_client.replace_rows("Messages", [_message_to_row(message) for message in self.messages])
         self.sheet_client.replace_rows("Questions", [_question_to_row(question) for question in self.questions])
@@ -131,6 +177,8 @@ def _headers_for_tab(tab_name: str) -> list[str]:
             "approved_at",
             "delivered_at",
             "last_am_review_sent_at",
+            "block_reason",
+            "retry_abandoned",
         ],
         "Messages": [
             "message_id",
@@ -192,6 +240,7 @@ def _client_to_row(client: Client) -> dict[str, str]:
 def _run_to_row(run: Run) -> dict[str, str]:
     row = {key: _format_value(value) for key, value in asdict(run).items()}
     row["status"] = run.status.value
+    row["retry_abandoned"] = "TRUE" if run.retry_abandoned else ""
     return row
 
 
@@ -223,6 +272,8 @@ def _run_from_row(row: dict[str, str]) -> Run:
         approved_at=parse_datetime(row.get("approved_at")),
         delivered_at=parse_datetime(row.get("delivered_at")),
         last_am_review_sent_at=parse_datetime(row.get("last_am_review_sent_at")),
+        block_reason=row.get("block_reason", "").strip(),
+        retry_abandoned=parse_bool(row.get("retry_abandoned")),
     )
 
 
